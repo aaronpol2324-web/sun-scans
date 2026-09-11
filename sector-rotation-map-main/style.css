@@ -1,0 +1,365 @@
+/* ================================================================
+   Sector Rotation Map — Dashboard Stylesheet
+   ================================================================ */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #0d1117;
+  color: #e6edf3;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  padding-bottom: 4px;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  background-color: #161b22;
+  border-bottom: 1px solid #30363d;
+  padding: 8px 16px;
+  gap: 16px;
+  height: 52px;
+  flex-shrink: 0;
+}
+
+.logo-area {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title-block {
+  display: flex;
+  flex-direction: column;
+}
+
+.site-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6edf3;
+  line-height: 1.2;
+}
+
+.site-subtitle {
+  font-size: 10px;
+  color: #8b949e;
+}
+
+.benchmark-control, .tail-control, .updated-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-label {
+  font-size: 10px;
+  color: #8b949e;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn-group {
+  display: flex;
+  gap: 4px;
+}
+
+.header-spacer {
+  flex: 1;
+}
+
+.updated-date {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #e6edf3;
+}
+
+/* ================================================================
+   Main Layout Grid (4 Columns: Left = Chart/Table, Right = 3 Full-Height Sidebars)
+   ================================================================ */
+.main-area {
+  display: grid;
+  grid-template-columns: 1fr 230px 230px 240px;
+  grid-template-rows: 1.4fr 1fr; /* Chart row gets more vertical room, table row fills the rest */
+  gap: 12px;
+  padding: 12px 16px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.chart-container {
+  grid-column: 1 / 5; /* Spans across the entire width */
+  grid-row: 1 / 2;
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.chart-wrapper {
+  width: 100%;
+  height: 100%;
+}
+
+.table-container {
+  grid-column: 1 / 5; /* Spans across the entire width */
+  grid-row: 2 / 3;
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  margin: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.table-header-bar {
+  padding: 8px 14px;
+  background-color: #21262d;
+  border-bottom: 1px solid #30363d;
+  flex-shrink: 0;
+}
+
+.table-header-bar h3 {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e6edf3;
+}
+
+.table-responsive {
+  flex: 1;
+  overflow-y: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  text-align: right;
+}
+
+th, td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #30363d;
+  white-space: nowrap;
+}
+
+th {
+  background-color: #161b22;
+  color: #8b949e;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+th:first-child, td:first-child,
+th:nth-child(2), td:nth-child(2) {
+  text-align: left;
+}
+
+tbody tr:hover {
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+/* 3. Sectors Sidebar (Column 2, spanning full height top-to-bottom) */
+.main-area > .sidebar:nth-of-type(1) {
+  grid-column: 2 / 3;
+  grid-row: 1 / 3;
+}
+
+/* 4. Mega-Themes Sidebar (Column 3, spanning full height top-to-bottom) */
+.main-area > .sidebar:nth-of-type(2) {
+  grid-column: 3 / 4;
+  grid-row: 1 / 3;
+}
+
+/* 5. Ticker Metrics Sidebar (Column 4, spanning full height top-to-bottom) */
+.main-area > .sidebar:nth-of-type(3) {
+  grid-column: 4 / 5;
+  grid-row: 1 / 3;
+}
+
+.sidebar {
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid #30363d;
+  background-color: #21262d;
+  flex-shrink: 0;
+}
+
+.sidebar-header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.sidebar-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6edf3;
+}
+
+.sector-count {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+.btn-add-symbol, .btn-toggle-all {
+  background: #30363d;
+  border: 1px solid #484f58;
+  color: #e6edf3;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-add-symbol:hover, .btn-toggle-all:hover {
+  background: #484f58;
+}
+
+.sector-list {
+  flex: 1;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+/* Force readable font scaling inside sidebar lists */
+.sector-list,
+.sector-list * {
+  font-size: 13px !important;
+}
+
+.sector-list strong,
+.sector-list b {
+  font-size: 14px !important;
+}
+
+/* Footer */
+.footer {
+  padding: 6px 16px;
+  text-align: center;
+  font-size: 10px;
+  color: #8b949e;
+  border-top: 1px solid #30363d;
+  background-color: #161b22;
+  flex-shrink: 0;
+}
+
+/* Tooltip & Modals */
+.tooltip {
+  position: absolute;
+  display: none;
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+
+.modal-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  width: 400px;
+  padding: 20px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.modal-desc {
+  font-size: 12px;
+  color: #8b949e;
+  margin-bottom: 12px;
+}
+
+.modal-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.modal-input {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 6px 10px;
+  color: #e6edf3;
+  font-size: 12px;
+}
+
+.modal-submit {
+  background: #00838f;
+  color: #fff;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.modal-submit:hover {
+  background: #0097a7;
+}
