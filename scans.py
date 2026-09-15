@@ -134,10 +134,11 @@ finviz_scans = {
         'Float Short': 'Over 30%'
     },
     "Finviz_IPO_Weekly": {
-        'Market Cap.': '+Mid (over $2bln)',
+        'Market Cap.': '+Small (over $300mln)',
         'EPS growthnext year': 'Positive (>0%)',
         'Average Volume': 'Over 1M',
-        'IPO Date': 'In the last year'
+        'IPO Date': 'In the last 3 years',
+        '50-Day Simple Moving Average': 'Price above SMA50'
     },
     "Finviz_Steve_Jacobs_RS": {
         'Market Cap.': '+Mid (over $2bln)',
