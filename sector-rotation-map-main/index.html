@@ -52,6 +52,10 @@
         <div class="btn-group" id="benchmarkButtons"></div>
       </div>
       <div class="header-spacer"></div>
+      <div class="view-control">
+        <span class="control-label">View</span>
+        <div class="btn-group" id="viewModeButtons"></div>
+      </div>
       <div class="tail-control">
         <span class="control-label">Tail Length</span>
         <div class="btn-group" id="tailButtons"></div>
@@ -65,7 +69,8 @@
     <!-- Main Content Area (Only 2 Core Components: Chart & Stats Table) -->
     <main class="main-area">
       <div class="chart-container" id="chartContainer">
-        <div class="chart-wrapper" id="chartWrapper"></div>
+        <div class="chart-wrapper" id="chartWrapper" style="width:100%; height:100%;"></div>
+        <div class="chart-grid-wrapper" id="chartGridContainer" style="display:none; height:100%; overflow-y:auto; padding:12px; box-sizing:border-box;"></div>
       </div>
 
       <!-- Statistical Grid Table with Group Selector Dropdown -->
@@ -75,6 +80,7 @@
 
           <!-- Dynamic Ticker Group Switcher Dropdown -->
           <div class="table-group-control" style="display: flex; align-items: center; gap: 8px;">
+            <button id="statsBackBtn" onclick="goBackStats()" style="display:none; background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-family: 'Inter', sans-serif; cursor: pointer;">&larr; Back</button>
             <label for="statsGroupSelect" style="font-size: 11px; color: #8b949e; font-family: 'Inter', sans-serif;">Table Universe:</label>
             <select id="statsGroupSelect" onchange="onStatsGroupChanged(this.value)" style="background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-family: 'Inter', sans-serif; cursor: pointer;">
               <option value="sectors">Sectors</option>
@@ -84,13 +90,18 @@
           </div>
         </div>
 
+        <div id="stateFilterBar" style="display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0;"></div>
+
         <div class="table-responsive">
           <table id="statsTable">
             <thead>
               <tr>
                 <th>Ticker</th>
                 <th>Description</th>
+                <th style="text-align: center;">State</th>
                 <th>Comp RS</th>
+                <th>8W RS<br>ROC</th>
+                <th>Breadth<br>(RS&ge;80)</th>
                 <th>Price</th>
                 <th>%Chg<br>1D</th>
                 <th>%Chg<br>1W</th>

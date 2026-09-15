@@ -14,7 +14,7 @@
         "Insurance + Asset Mgmt": ["JXN", "VOYA", "EQH", "CRBG", "MFC", "SLF", "FGN", "PUK", "FG", "BHF"]
     },
     "Diagnostics & Digital Health": {
-        "CROs": ["IQV", "ICLR", "CRL", "MEDP", "FTRE"],
+        "CRO + AI": ["IQV", "ICLR", "CRL", "MEDP", "FTRE"],
         "Digital Health": ["AMWL", "MMED", "GDRX", "TDOC", "LFMD"],
         "Diagnostics": ["CDNA", "BDSX", "PSNL", "NTRA", "GH", "NEO", "PRE", "ADPT", "FRNM", "TLX", "DGX", "OPK", "RDNT", "GRAL", "XGN", "CSTL", "CAI", "ALMR", "CTKB", "BLLN", "VCYT", "IMDX", "LMRI", "NIKI", "OSUR", "QTRX", "MYGN", "QDEL"],
         "Drug Discovery AI": ["CDNA", "BDSX", "PSNL", "NTRA", "GH", "NEO", "PRE", "ADPT", "FRNM", "TLX", "DGX", "OPK", "RDNT", "GRAL", "XGN", "CSTL", "CAI", "ALMR", "CTKB", "BLLN", "VCYT", "IMDX", "LMRI", "NIKI", "OSUR", "QTRX", "MYGN", "QDEL"],
@@ -104,19 +104,19 @@
         "Food Manufacturing / Processing": ["CHEF", "SENEA", "ARMK", "SYY", "UNFI", "MAMA", "WYHG", "USFD", "PPC", "JBSS", "PFGC", "DMC", "POST", "JBS", "LW", "TSN", "CALM", "INGR", "FLO", "VITL", "SFD"]
     },
     "Industrial Equipment & Services": {
-        "Staffing + IT Services": [],
-        "Electronics Distribution": [],
-        "Industrial Distribution": [],
-        "Business Services": [],
-        "Waste Management": [],
-        "Specialty Distribution": [],
-        "Electronic Instruments": [],
-        "Industrial Equipment": [],
-        "Electronics Mfg Services": [],
-        "Specialty Services": [],
-        "Specialty Manufacturing": [],
-        "Equipment Rental": [],
-        "Water Technology": []
+        "Staffing + IT Services": ["RCMT", "NSP", "MAN", "KELYA", "TBI", "KFRC", "RHI", "RGP", "BBSI"],
+        "Electronics Distribution": ["AVT", "ARW", "SNX", "SCSC", "INGM", "RELL", "BELFB", "ADIG", "BELFA"],
+        "Industrial Distribution": ["DXPE", "MSM", "DNOW", "FAST", "GWW", "AIT", "SNA", "HLMN"],
+        "Business Services": ["XRX", "QUAD", "PBI", "ACCO", "PPHC", "EBF", "BRC", "KODK", "DLX"],
+        "Waste Management": ["NVRI", "CLH", "PESI", "RSG", "CECO", "GFL", "CWST", "ONT", "WCN", "WM"],
+        "Specialty Distribution": ["GIC", "WCC", "VSTS", "UNF", "CTAS", "WKC", "EVI", "FERG", "CNM", "QXO", "SITE", "POOL"],
+        "Electronic Instruments": ["MG", "PLPC", "ALNT", "MEI", "AME", "TRNS", "FCUV", "DGII", "TRT", "KRNT", "MSA", "AYI", "LYTS", "VPG", "FTV", "POWL", "MIND", "BMI", "CODA", "ITRI", "VNT"],
+        "Industrial Equipment": ["MTW", "TWIN", "PKOH", "NDSN", "MLR", "IEX", "ITT", "CR", "GTES", "TKR", "GRC", "HY", "SWK", "FLS", "CMCO", "PH", "MMM", "LECO", "TNC", "ITW", "HLIO", "KAI", "FELE", "SPXC", "MAIR", "KMT", "RBC", "INIO", "MIDD", "DCI", "ATMU", "RRX", "CYD", "CMI", "JBTM", "GGG", "EPAC", "PSIX", "MFP", "IR", "AOS", "ESAB", "OTIS"],
+        "Electronics Mfg Services": ["PLXS", "SANM", "BHE", "CLS", "KE", "TTMI", "FLEX", "JBL", "TSSI", "FN"],
+        "Specialty Services": ["CXW", "GEO", "ABM", "SCI", "BV", "RBA", "BGSI", "CSV", "RTO", "ROL"],
+        "Specialty Manufacturing": ["TH", "NPK", "SIF", "CVEO", "NNBR", "CODI", "ODC", "GFF", "AZZ", "CSW", "TRS", "NPKI", "NPO", "BOXL", "BOOM", "CVGI", "TWI", "ALH", "CSL", "LAKE", "SXI", "VATE", "MEC", "AWI", "IEP", "DOV", "MATW"],
+        "Equipment Rental": ["SUNB", "HRI", "URI", "MGRC", "ALTG", "EQPT", "WSC"],
+        "Water Technology": ["WTS", "AIRJ", "CDZI", "VLTO", "ZWS", "MWA", "WMS", "CWCO", "XYL", "ERII", "PNR"]
     },
     "Semiconductors & Hardware": {
         "Memory": ["SNDK", "MU", "SKHY", "STX", "WDC", "MRAM", "GSIT", "RMBS"],
