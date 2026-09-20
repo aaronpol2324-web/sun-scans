@@ -1419,7 +1419,8 @@ RS_RS_DATA_START_COL = RS_PRICE_DATA_START_COL + RS_SPARKLINE_WINDOW
 RS_TOTAL_COLS = RS_RS_DATA_START_COL + RS_SPARKLINE_WINDOW
 
 
-def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int):
+def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int,
+                   col_offset: int = 0, extra_headers: list = None):
     """Turn this block's range into a native Excel Table so its header
     row gets Excel's own sort/filter dropdown arrows, scoped to just
     this block. A plain autofilter (ws.autofilter(), used by every other
@@ -1450,12 +1451,20 @@ def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int):
     and color scales already written. Excel requires every table column
     to have its own non-blank, unique header string even when the
     column itself is hidden (see _rs_setup_worksheet) and never shown,
-    so the hidden columns get plain placeholder names."""
+    so the hidden columns get plain placeholder names.
+
+    col_offset/extra_headers: for write_rs_flat_sheet's leading
+    identifying columns (e.g. "Category"/"Sub-Theme") that sit in front
+    of the usual RS_TAB_HEADERS block -- see that function. Every other
+    caller leaves these at their defaults, which reproduces the exact
+    table this function always built."""
+    extra_headers = extra_headers or []
     header_fmt = _header_format(workbook, fmt_cache)
-    columns = [{'header': h, 'header_format': header_fmt} for h in RS_TAB_HEADERS]
+    columns = [{'header': h, 'header_format': header_fmt} for h in extra_headers]
+    columns += [{'header': h, 'header_format': header_fmt} for h in RS_TAB_HEADERS]
     columns += [{'header': f"_PriceData{i + 1}", 'header_format': header_fmt} for i in range(RS_SPARKLINE_WINDOW)]
     columns += [{'header': f"_RSData{i + 1}", 'header_format': header_fmt} for i in range(RS_SPARKLINE_WINDOW)]
-    ws.add_table(header_row, 0, last_data_row, RS_TOTAL_COLS - 1, {
+    ws.add_table(header_row, 0, last_data_row, col_offset + RS_TOTAL_COLS - 1, {
         'columns': columns,
         'style': None,
         'banded_rows': False,
@@ -1466,15 +1475,20 @@ def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int):
     })
 
 
-def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool):
+def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool, col_offset: int = 0):
     """Write one ticker's visible cells (formats matched to the rest of
     the workbook via _column_format, so e.g. 'Price' and 'Off 52W High %'
     look identical to their counterparts on a regular scan tab) plus its
     hidden sparkline-source cells. The sparkline itself is a separate,
     worksheet-level call (_rs_add_sparklines) -- add_sparkline isn't a
-    per-cell write."""
+    per-cell write.
+
+    col_offset shifts every column this writes by that many columns --
+    see write_rs_flat_sheet, whose leading identifying columns (written
+    separately, by _rs_write_group_cells) occupy columns [0, col_offset)."""
     zebra_bg = {'bg_color': _hex(COLOR_ZEBRA)} if zebra else {}
-    for c, header in enumerate(RS_TAB_HEADERS):
+    for i, header in enumerate(RS_TAB_HEADERS):
+        c = col_offset + i
         if header in ("1-Mth Chart", "1-Mth RS"):
             fmt = _data_format(workbook, fmt_cache, None, zebra)
             ws.write_blank(row, c, None, fmt)  # the sparkline draws over this blank cell
@@ -1494,13 +1508,31 @@ def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool):
             _write_cell(ws, row, c, value, fmt)
 
     hidden_fmt = _get_format(workbook, fmt_cache, ('rs', 'hidden'), {'num_format': '0.0000'})
+    price_start = col_offset + RS_PRICE_DATA_START_COL
+    rs_start = col_offset + RS_RS_DATA_START_COL
     for i, v in enumerate(row_dict.get("_PriceSpark") or []):
-        ws.write_number(row, RS_PRICE_DATA_START_COL + i, float(v), hidden_fmt)
+        ws.write_number(row, price_start + i, float(v), hidden_fmt)
     for i, v in enumerate(row_dict.get("_RSSpark") or []):
-        ws.write_number(row, RS_RS_DATA_START_COL + i, float(v), hidden_fmt)
+        ws.write_number(row, rs_start + i, float(v), hidden_fmt)
 
 
-def _rs_add_sparklines(ws, row, row_dict: dict):
+def _rs_write_group_cells(ws, workbook, fmt_cache, row, row_dict: dict, group_cols: list, zebra: bool):
+    """write_rs_flat_sheet's leading identifying columns (e.g. "Category"
+    for a mega theme, "Sub-Theme" for a sub-theme) -- plain left-aligned
+    text cells, styled like the rest of the row (same zebra shading).
+    Every one of these is also a real Excel Table column, so it gets its
+    own header filter dropdown -- checking just one value there is how a
+    caller drills down (e.g. filter Sub_Themes to one mega theme's name,
+    or Tickers to one sub-theme's name)."""
+    zebra_bg = {'bg_color': _hex(COLOR_ZEBRA)} if zebra else {}
+    fmt = _get_format(workbook, fmt_cache, ('rs', 'group', zebra),
+                       dict(zebra_bg, align='left', valign='vcenter', indent=1))
+    for c, header in enumerate(group_cols):
+        value = row_dict.get(header)
+        ws.write_string(row, c, "" if value is None else str(value), fmt)
+
+
+def _rs_add_sparklines(ws, row, row_dict: dict, col_offset: int = 0):
     """Line sparkline for the trailing month of price (a cyan trendline
     with a dark-slate marker dot at the period's highest close) and a
     column sparkline of the trailing month's "1-Mth RRS" reading
@@ -1523,9 +1555,11 @@ def _rs_add_sparklines(ws, row, row_dict: dict):
     # Excel even though the XML and the data are otherwise correct.
     price_spark = row_dict.get("_PriceSpark") or []
     rs_spark = row_dict.get("_RSSpark") or []
+    price_start = col_offset + RS_PRICE_DATA_START_COL
+    rs_start = col_offset + RS_RS_DATA_START_COL
     if len(price_spark) >= 2:
-        ws.add_sparkline(row, RS_COL_SPARK_PRICE, {
-            'range': xlsxwriter.utility.xl_range(row, RS_PRICE_DATA_START_COL, row, RS_PRICE_DATA_START_COL + len(price_spark) - 1),
+        ws.add_sparkline(row, col_offset + RS_COL_SPARK_PRICE, {
+            'range': xlsxwriter.utility.xl_range(row, price_start, row, price_start + len(price_spark) - 1),
             'type': 'line', 'weight': 1.25,
             'series_color': _hex(COLOR_ACCENT_CYAN),
             'markers': False, 'high_point': True,
@@ -1533,8 +1567,8 @@ def _rs_add_sparklines(ws, row, row_dict: dict):
             'show_hidden': True,
         })
     if len(rs_spark) >= 2:
-        ws.add_sparkline(row, RS_COL_SPARK_RS, {
-            'range': xlsxwriter.utility.xl_range(row, RS_RS_DATA_START_COL, row, RS_RS_DATA_START_COL + len(rs_spark) - 1),
+        ws.add_sparkline(row, col_offset + RS_COL_SPARK_RS, {
+            'range': xlsxwriter.utility.xl_range(row, rs_start, row, rs_start + len(rs_spark) - 1),
             'type': 'column',
             'series_color': _hex(COLOR_SCALE_HIGH),      # positive RRS bars
             'negative_points': True,
@@ -1544,7 +1578,7 @@ def _rs_add_sparklines(ws, row, row_dict: dict):
         })
 
 
-def _rs_conditional_format(ws, first_row, last_row):
+def _rs_conditional_format(ws, first_row, last_row, col_offset: int = 0):
     """The same 3-color scale every other tab's percent columns get (see
     _fit_column), applied to just this row range -- the whole sheet for
     RS_Groups, or one category block at a time for RS_Indices_Sectors,
@@ -1554,41 +1588,90 @@ def _rs_conditional_format(ws, first_row, last_row):
     if last_row < first_row:
         return
     for col_idx in (RS_COL_THRUST, RS_COL_1MRS, RS_COL_1D, RS_COL_1M, RS_COL_OFFHIGH):
-        ws.conditional_format(first_row, col_idx, last_row, col_idx, {
+        ws.conditional_format(first_row, col_offset + col_idx, last_row, col_offset + col_idx, {
             'type': '3_color_scale',
             'min_color': _hex(COLOR_SCALE_LOW), 'mid_color': _hex(COLOR_SCALE_MID), 'max_color': _hex(COLOR_SCALE_HIGH),
             'min_type': 'min', 'mid_type': 'percentile', 'mid_value': 50, 'max_type': 'max',
         })
 
 
-def _rs_setup_worksheet(ws):
-    ws.set_column(RS_COL_TICKER, RS_COL_TICKER, 8)
-    ws.set_column(RS_COL_NAME, RS_COL_NAME, 30)
-    ws.set_column(RS_COL_THRUST, RS_COL_1MRS, 13)
-    ws.set_column(RS_COL_SPARK_PRICE, RS_COL_SPARK_RS, 14)
-    ws.set_column(RS_COL_1D, RS_COL_OFFHIGH, 12)
-    ws.set_column(RS_COL_PRICE, RS_COL_PRICE, 10)
-    ws.set_column(RS_PRICE_DATA_START_COL, RS_TOTAL_COLS - 1, None, None, {'hidden': True})
+def _rs_setup_worksheet(ws, col_offset: int = 0):
+    ws.set_column(col_offset + RS_COL_TICKER, col_offset + RS_COL_TICKER, 8)
+    ws.set_column(col_offset + RS_COL_NAME, col_offset + RS_COL_NAME, 30)
+    ws.set_column(col_offset + RS_COL_THRUST, col_offset + RS_COL_1MRS, 13)
+    ws.set_column(col_offset + RS_COL_SPARK_PRICE, col_offset + RS_COL_SPARK_RS, 14)
+    ws.set_column(col_offset + RS_COL_1D, col_offset + RS_COL_OFFHIGH, 12)
+    ws.set_column(col_offset + RS_COL_PRICE, col_offset + RS_COL_PRICE, 10)
+    ws.set_column(col_offset + RS_PRICE_DATA_START_COL, col_offset + RS_TOTAL_COLS - 1, None, None, {'hidden': True})
 
 
-def _rs_write_block(ws, workbook, fmt_cache, df: pd.DataFrame, start_row: int) -> int:
+def _rs_write_block(ws, workbook, fmt_cache, df: pd.DataFrame, start_row: int,
+                     col_offset: int = 0, group_cols: list = None) -> int:
     """Write one self-contained mini-table -- its own header row, then
     one data row per ticker with sparklines -- and return the row just
     after the last data row. Writing each category as its own Excel
     Table (its own repeated header row included) is what makes it
     independently sortable: click that header's own filter arrow and
     Excel sorts/filters just this block, without disturbing any other
-    category."""
+    category.
+
+    col_offset/group_cols: write_rs_flat_sheet's leading identifying
+    columns (see _rs_write_group_cells) -- every other caller leaves
+    these at their defaults and gets exactly the block this always
+    wrote."""
+    group_cols = group_cols or []
     row = start_row + 1  # start_row is reserved for the header; _rs_add_table writes it
     first_data_row = row
     for i, (_, series) in enumerate(df.iterrows()):
         row_dict = series.to_dict()
-        _rs_write_row(ws, workbook, fmt_cache, row, row_dict, zebra=(i % 2 == 0))
-        _rs_add_sparklines(ws, row, row_dict)
+        zebra = (i % 2 == 0)
+        if group_cols:
+            _rs_write_group_cells(ws, workbook, fmt_cache, row, row_dict, group_cols, zebra)
+        _rs_write_row(ws, workbook, fmt_cache, row, row_dict, zebra=zebra, col_offset=col_offset)
+        _rs_add_sparklines(ws, row, row_dict, col_offset=col_offset)
         row += 1
-    _rs_conditional_format(ws, first_data_row, row - 1)
-    _rs_add_table(ws, workbook, fmt_cache, start_row, row - 1)
+    _rs_conditional_format(ws, first_data_row, row - 1, col_offset=col_offset)
+    _rs_add_table(ws, workbook, fmt_cache, start_row, row - 1, col_offset=col_offset, extra_headers=group_cols)
     return row
+
+
+def write_rs_flat_sheet(workbook, fmt_cache: dict, df: pd.DataFrame, sheet_name: str, group_cols: list = None):
+    """A single, flat, fully sortable/filterable Excel Table -- every row
+    under one shared header, no per-category banner blocks -- for a
+    caller that wants ALL rows visible and sortable together rather than
+    split into independent per-category mini-tables (compare
+    write_rs_indices_sheet, which deliberately does the opposite).
+
+    group_cols are extra identifying columns (e.g. "Category" for a mega
+    theme, "Sub-Theme") rendered as real, sortable, FILTERABLE leading
+    data columns -- every column in an Excel Table gets its own header
+    dropdown, so checking/unchecking values in a group column's dropdown
+    is how a caller drills down. theme_rotation.py uses this for all
+    three of its tabs: Mega_Themes (no group_cols -- nothing above a
+    mega theme), Sub_Themes (group_cols=["Category"] -- filter to one
+    mega theme), and Tickers (group_cols=["Category", "Sub-Theme"] --
+    filter to one sub-theme's actual constituents).
+
+    Reuses every bit of scans.py's RS-tab rendering (row formatting, the
+    two-tone RRS histogram sparklines, per-block Table, 3-color
+    conditional formatting) via the col_offset/group_cols plumbing those
+    functions accept -- this function only adds the leading group_cols
+    block and default sorts the whole tab (same 1-Mth RRS / RS Thrust
+    order as every other RS tab) before writing it as one block."""
+    if df is None or df.empty:
+        return None
+    group_cols = group_cols or []
+    col_offset = len(group_cols)
+    df = df.sort_values(by=["1-Mth RRS", "RS Thrust"], ascending=False,
+                         na_position="last", kind="stable")
+    ws = workbook.add_worksheet(sheet_name)
+    _rs_setup_worksheet(ws, col_offset=col_offset)
+    for i, _ in enumerate(group_cols):
+        ws.set_column(i, i, 24)
+    ws.freeze_panes(1, col_offset + 2)
+    ws.set_row(0, 30)
+    _rs_write_block(ws, workbook, fmt_cache, df, start_row=0, col_offset=col_offset, group_cols=group_cols)
+    return ws
 
 
 def write_rs_groups_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
@@ -1623,7 +1706,7 @@ def write_rs_groups_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
 RS_UNSORTED_CATEGORIES = {"Segment"}
 
 
-def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
+def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame, sheet_name: str = 'RS_Indices_Sectors'):
     """RS_Indices_Sectors: one mini-table per category (Index / Segment /
     EW Sector / SPDR Sector), each with its own repeated header row --
     every ticker is scored independently (see run_rs_dashboard), so
@@ -1633,10 +1716,18 @@ def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
     'Category' column. Row freezing is column-only (not row-only)
     because the header row's position shifts from block to block, so
     freezing a fixed row wouldn't keep every block's own header in
-    view the way it does on RS_Groups."""
+    view the way it does on RS_Groups.
+
+    sheet_name defaults to this tab's own name for scans.py's own
+    three-tab workbook, but this whole function -- layout, sorting,
+    sparklines, per-block Excel Table, everything -- is completely
+    generic over any DataFrame with this same Category/Ticker/Name/...
+    schema. theme_rotation.py reuses it as-is for its own, differently-
+    named standalone workbook (its rows are sub-themes, not tickers)
+    rather than duplicating this rendering pipeline a second time."""
     if df is None or df.empty:
         return None
-    ws = workbook.add_worksheet('RS_Indices_Sectors')
+    ws = workbook.add_worksheet(sheet_name)
     _rs_setup_worksheet(ws)
     ws.freeze_panes(0, 2)
     category_fmt = _get_format(workbook, fmt_cache, ('rs', 'category'), {

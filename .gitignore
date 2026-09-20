@@ -1,0 +1,12 @@
+# theme_rotation.py's daily data cache -- regenerated on every run, changes
+# (and grows) constantly, and isn't real project content. Never commit this.
+theme_data_cache.pkl
+
+# Excel's own temporary lock files -- created while a workbook is open,
+# deleted automatically when it's closed. Never meant to be saved anywhere.
+~$*.xlsx
+~$*.xls
+
+# Python bytecode cache
+__pycache__/
+*.pyc
