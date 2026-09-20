@@ -677,80 +677,123 @@ def run_finviz_scan(name, filters_dict):
 # =====================================================================
 # RS DASHBOARD (RS_Groups / RS_Indices_Sectors tabs)
 # ---------------------------------------------------------------------
-# A "reasonable facsimile" of Jeff Sun's (@jfsrev) thematic-ETF and
-# index/sector relative-strength dashboards on X/Twitter. His
-# "RS Thrust Rate %" and "1-Mth RS %" are his own proprietary scoring
-# with no published formula -- what's computed below under the same
-# names is a transparent stand-in, not a reproduction of his exact
-# numbers:
+# This used to chase a facsimile of a specific paid dashboard (Jeff
+# Sun's, @jfsrev) whose exact scoring formula was never published.
+# After months of reverse-engineering guesses that kept missing, we
+# dropped that entirely in favor of Real Relative Strength (RRS): a
+# fully public, well-documented indicator (the ThinkOrSwim community's
+# "RealRelativeStrength" study -- the user supplied the actual script)
+# with no unknowns to guess at. Every number below is computed exactly
+# as that script defines it; nothing here is an approximation of
+# somebody else's private formula.
 #
-#   RS Thrust %   = percentile rank, within this tab's own ticker list
-#                   only, of each ticker's trailing RS_THRUST_WINDOW
-#                   (5) trading-day price return. Short lookback, so
-#                   it reflects who's accelerating right now.
-#   1-Mth RS %    = percentile rank, within this tab's own ticker list
-#                   only, of each ticker's trailing RS_ONE_MONTH_WINDOW
-#                   (21) trading-day price return. Longer lookback, a
-#                   smoother trend read.
+# THE IDEA: a ratio like "close / SPY's close" treats a 1% move the
+# same whether the ticker is a sleepy utility or a wild small-cap --
+# but a 1% day is nothing for the small-cap and huge for the utility.
+# RRS fixes that by asking "given how much SPY moved, and how volatile
+# this ticker normally is, how big a move would we EXPECT? Was the
+# ACTUAL move bigger or smaller than that, and by how much (in units
+# of this ticker's own typical daily range)?" A positive RRS means the
+# ticker outperformed what its own volatility would predict from SPY's
+# move; negative means it underperformed. It's a volatility-adjusted
+# excess return, not a percentage -- so despite the column names below
+# keeping "RS" in them, these are NOT percentiles or percentages, and
+# aren't formatted as one.
 #
-# This is the same spirit as IBD's classic Relative Strength Rating --
-# a percentile against the peer universe on the same tab, not a ratio
-# against any single benchmark ticker -- which is also why SPY/TLT can
-# show different scores on each tab they appear on, and why a strong
-# stretch for the whole list can push many names to 100% at once (it's
-# a percentile, not a fixed bar).
+# THE FORMULA (window = RS_THRUST_WINDOW for "RS Thrust", or
+# RS_ONE_MONTH_WINDOW for "1-Mth RRS" -- see _rs_rrs):
+#   symbol_move   = ticker's close now minus its close `window` bars ago
+#   bench_move    = SPY's close now minus its close `window` bars ago
+#   symbol_atr    = Wilder's ATR(window) of the ticker
+#   bench_atr     = Wilder's ATR(window) of SPY
+#   power_index   = bench_move / bench_atr        -- SPY's move, in units of SPY's own ATR
+#   expected_move = power_index * symbol_atr       -- what the ticker "should" have done, scaled to ITS OWN volatility
+#   RRS           = (symbol_move - expected_move) / symbol_atr   -- the excess, in units of the ticker's own ATR
+#
+# SPY's own row can't be compared to itself this way -- the algebra
+# above cancels to exactly 0 for every single day when ticker == SPY,
+# a flat, uninformative line. So for that one row (or when SPY history
+# is unavailable at all) we skip the "expected move" subtraction and
+# just report symbol_move / symbol_atr -- "how many ATRs has this
+# moved," a self-referential momentum reading rather than an RS one.
+#
+# "RS Thrust" uses the short (RS_THRUST_WINDOW, "the past week")
+# window -- fast-moving, for who's accelerating right now. "1-Mth
+# RRS" uses the long (RS_ONE_MONTH_WINDOW) window -- slower, for the
+# underlying trend. The "1-Mth RS" histogram plots the trailing
+# RS_SPARKLINE_WINDOW days of that same slow RRS reading, so the
+# number and the chart are the same series -- and because RRS is a
+# genuinely signed quantity (unlike the stochastic/percentile designs
+# tried before this), the histogram is colored two-tone: one color
+# above zero, another below, matching what the original script's own
+# chart does.
 # =====================================================================
 
-RS_THRUST_WINDOW = 5
+RS_THRUST_WINDOW = 5      # "the past week"
 RS_ONE_MONTH_WINDOW = 21
 
-# Fixed watchlist order (not resorted by score), matching the source
-# dashboard's own row order.
+# Just the watchlist of (ticker, name) pairs -- the row order actually
+# written to the sheet is a default sort by 1-Mth RRS (see
+# write_rs_groups_sheet), so the order here doesn't matter.
+#
+# Every entry below is one we've directly confirmed, by ticker AND
+# name, in his most recent COMPLETE "Groups" table screenshot
+# (x.com/jfsrev/status/2101207434270552238, posted 9/19/2026 -- its own
+# right-hand text panel independently lists the same tickers/names as
+# the table itself, confirming the table wasn't cut off). That post is
+# now the single source of truth for this list -- not a running union
+# of every screenshot we've ever been shown. A prior round of this
+# list had accumulated 20 tickers (CLOU, XHS, KIE, BETZ, IHF, PBJ,
+# USO, SOCL, IYZ, CNBS, WCLD, IGV, XOP, EWY, GNR, EWZ, ICLN, UFO, XSW,
+# GUNR) that were confirmed at some earlier point but are NOT in this
+# latest complete table, so they're dropped rather than held onto on
+# the assumption they're still current.
 RS_GROUPS = [
     ("BUG", "Pure Cybersecurity Software"),
     ("CIBR", "Cybersecurity Software & Infra"),
     ("BOAT", "Global Shipping"),
-    ("CLOU", "Cloud Infrastructure & SaaS"),
     ("MAGS", "Magnificent 7"),
     ("WOOD", "Timber & Lumber"),
     ("TLT", "20+ Year Treasury Bonds"),
     ("ARKG", "ARK Genomics"),
     ("FDN", "US Internet Giants"),
+    ("UNG", "Natural Gas"),
+    ("ESPO", "E-Sports"),
     ("AIQ", "AI Software & Data Processing"),
+    ("HYDR", "Hydrogen Energy & Fuel Cells"),
+    ("IDGT", "Digital Infrastructure & Data Centers"),
+    ("XTL", "Telecom"),
+    ("ARKX", "ARK Space Exploration"),
     ("SVIX", "Short VIX Futures (Volatility)"),
+    ("ASHR", "China A-Share"),
     ("BUZZ", "Social Media"),
     ("NASA", "Space Economy"),
     ("ARKK", "ARK Innovation"),
+    ("SPMO", "S&P 500 Momentum"),
+    ("XSD", "Semiconductors (Equal)"),
+    ("DRAM", "Memory"),
+    ("ETHA", "Ether Spot"),
+    ("AMLP", "Energy MLPs"),
     ("BOTZ", "AI & Robotics"),
     ("ARKQ", "ARK Robotics"),
-    ("ARKX", "ARK Space Exploration"),
-    ("ROBO", "Robotics & Automation"),
     ("ARKW", "ARK Internet & Next-Gen Tech"),
-    ("IDGT", "Digital Infrastructure & Data Centers"),
-    ("XSD", "Semiconductors (Equal)"),
     ("QTUM", "Quantum/AI"),
-    ("PBE", "Dynamic Biotech"),
-    ("CNBS", "Cannabis"),
-    ("HYDR", "Hydrogen Energy & Fuel Cells"),
     ("BAI", "AI & Tech Active"),
     ("MEME", "Meme"),
-    ("ESPO", "E-Sports"),
-    ("WCLD", "Cloud Tech"),
-    ("UFO", "Space Industry"),
-    ("SLX", "Steel"),
     ("SOXX", "Broad Semiconductor"),
-    ("XHS", "Healthcare Facilities & Services"),
-    ("GNR", "Natural Resources"),
-    ("ETHA", "Ether Spot"),
-    ("IBB", "Biotech Megacap"),
-    ("IGV", "US Tech/Software"),
-    ("UNG", "Natural Gas"),
     ("WGMI", "Internet Services & Infrastructure"),
-    ("IGF", "Global Infrastructure Assets"),
-    ("KIE", "Insurance"),
-    ("MOO", "Global Agricultural Producers"),
-    ("EWZ", "Brazilian Equities"),
-    ("ICLN", "Clean Energy"),
+    ("SMH", "Semiconductors Giants"),
+    ("SOLZ", "Solana Spot"),
+    ("IBIT", "Bitcoin Spot"),
+    ("BLOK", "Blockchain"),
+    ("ROBO", "Robotics & Automation"),
+    ("PPLT", "Platinum"),
+    ("GXC", "China ETF"),
+    ("GRID", "Infrastructure & Electrical Equipment"),
+    ("KURE", "China Health"),
+    ("ARKF", "ARK Fintech"),
+    ("SLV", "Silver"),
+    ("PBE", "Dynamic Biotech"),
 ]
 
 # (category, ticker, name) -- category becomes its own filterable
@@ -833,79 +876,160 @@ def _fetch_rs_history(tickers):
 RS_SPARKLINE_WINDOW = 21
 
 
-def _rs_metrics_for(df: pd.DataFrame):
-    """Raw (not-yet-percentile-ranked) fields for one ticker: latest
-    price, 1D/1-Month % change, the short-window return the Thrust
-    percentile is ranked on, % off the trailing 52-week high, and the
-    two trailing-21-session series the RS Dashboard's sparklines draw
-    from."""
+def _rs_true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """Classic True Range: the largest of today's high-low range, and
+    the gap between today's high/low and YESTERDAY's close -- so a gap
+    up or down on the open still counts as "range," not just the
+    intraday bar. The building block for Wilder's ATR below."""
+    prev_close = close.shift(1)
+    return pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+
+def _rs_wilders_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
+    """Wilder's Average True Range: True Range smoothed with an EMA of
+    alpha = 1/window (the classic Wilder smoothing constant), which is
+    what `ewm(alpha=1/window, adjust=False)` computes. min_periods
+    keeps the first `window`-1 bars NaN (not enough history yet)
+    instead of quietly averaging over a too-short warmup window."""
+    tr = _rs_true_range(high, low, close)
+    return tr.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
+
+
+def _rs_rrs(symbol_high, symbol_low, symbol_close,
+            bench_high, bench_low, bench_close, window: int) -> pd.Series:
+    """Real Relative Strength (RRS), vectorized across `symbol_close`'s
+    own date index -- see the RS DASHBOARD header comment for the full
+    derivation. `bench_*` must already be reindexed to that same date
+    index by the caller.
+
+    In words: take SPY's `window`-session move, express it in units of
+    SPY's OWN typical volatility (its Wilder's ATR) -- that's the
+    "power index," how hard the market pushed relative to its own
+    normal noise. Scale that push by this ticker's own volatility to
+    get an "expected move" -- what this ticker "should" have done if
+    it simply moved with the market, proportionally. RRS is how far
+    the ACTUAL move over/undershot that expectation, again measured in
+    units of the ticker's own ATR: positive means it outperformed what
+    its own volatility would predict from SPY's move, negative means
+    it underperformed. Not a percentage -- a multiple of the ticker's
+    own typical daily range."""
+    symbol_atr = _rs_wilders_atr(symbol_high, symbol_low, symbol_close, window)
+    bench_atr = _rs_wilders_atr(bench_high, bench_low, bench_close, window)
+    symbol_move = symbol_close - symbol_close.shift(window)
+    bench_move = bench_close - bench_close.shift(window)
+    power_index = bench_move / bench_atr.where(bench_atr != 0)
+    expected_move = power_index * symbol_atr
+    return (symbol_move - expected_move) / symbol_atr.where(symbol_atr != 0)
+
+
+def _rs_self_momentum(symbol_high, symbol_low, symbol_close, window: int) -> pd.Series:
+    """Fallback for SPY's own row (or any ticker with no benchmark
+    history to compare against): _rs_rrs's algebra cancels to exactly
+    0 for every single day when the ticker IS the benchmark (a flat,
+    uninformative line), so instead this skips the "expected move"
+    subtraction entirely and reports the ticker's own `window`-session
+    move in units of its own ATR -- "how many ATRs has this moved," a
+    self-referential momentum reading rather than a relative-strength
+    one."""
+    symbol_atr = _rs_wilders_atr(symbol_high, symbol_low, symbol_close, window)
+    symbol_move = symbol_close - symbol_close.shift(window)
+    return symbol_move / symbol_atr.where(symbol_atr != 0)
+
+
+def _rs_metrics_for(df: pd.DataFrame, spy_df: pd.DataFrame = None, ticker: str = None):
+    """Fields for one ticker: latest price, 1D/1-Month % change, % off
+    the trailing 52-week high, the trailing-21-session price series
+    the price sparkline draws from, and the Real Relative Strength
+    (RRS) readings ("RS Thrust" / "1-Mth RRS") that _rs_rrs computes --
+    see that function and the RS DASHBOARD header comment above for
+    what these are and why.
+
+    spy_df: SPY's own OHLC DataFrame (same columns as `df`, i.e. High/
+    Low/Close) -- the benchmark RRS is measured against. Optional only
+    so this function still works standalone/in tests without it.
+
+    ticker: the symbol this row IS, so we can tell when it's SPY
+    itself. RS_Indices_Sectors carries SPY as an actual tracked row
+    (under Index/EW Sector/SPDR Sector) in addition to using it as
+    the external benchmark -- see _rs_self_momentum for why that row
+    needs a different formula, not just a ratio against itself."""
     close = df['Close']
+    high = df['High']
+    low = df['Low']
     last = float(close.iloc[-1])
     pct_1d = round((last / float(close.iloc[-2]) - 1) * 100, 2) if len(close) >= 2 else None
     if len(close) > RS_ONE_MONTH_WINDOW:
         pct_1m = round((last / float(close.iloc[-1 - RS_ONE_MONTH_WINDOW]) - 1) * 100, 2)
-        thrust_return = round((last / float(close.iloc[-1 - RS_THRUST_WINDOW]) - 1) * 100, 2)
     else:
         pct_1m = None
-        thrust_return = None
+
     week52_high = float(close.tail(min(len(close), 252)).max())
     pct_off_high = round((last / week52_high - 1) * 100, 2) if week52_high else None
     price_spark = close.tail(RS_SPARKLINE_WINDOW).astype(float).tolist()
 
-    # The "1-Mth RS" histogram's source series -- deliberately NOT
-    # day-over-day % change. A plain return series is positive about as
-    # often as it's negative, so a column sparkline of it draws bars both
-    # above AND below a zero line with two alternating colors -- not what
-    # the source dashboard's histogram looks like (a single-color shape
-    # that only ever grows up from a zero baseline, with one darker bar
-    # marking its peak). What actually produces that shape is the
-    # window's CUMULATIVE return trajectory (each day vs. the start of
-    # the window), rebased so the window's own low point sits at zero.
-    # The tallest bar then naturally lands on the day the ticker's RS
-    # trend actually peaked within the month -- the same idea as the
-    # price chart's high-point dot, just for the cumulative RS line.
-    window_prices = close.tail(RS_SPARKLINE_WINDOW + 1)
-    if len(window_prices) >= 2:
-        cum_pct = (window_prices / float(window_prices.iloc[0]) - 1) * 100
-        cum_pct = cum_pct.iloc[1:]  # drop the leading, always-zero start-of-window point
-        rs_spark = (cum_pct - cum_pct.min()).round(3).tolist()
+    if ticker == "SPY" or spy_df is None:
+        rrs_fast_series = _rs_self_momentum(high, low, close, RS_THRUST_WINDOW)
+        rrs_slow_series = _rs_self_momentum(high, low, close, RS_ONE_MONTH_WINDOW)
     else:
-        rs_spark = []
+        # Reindex SPY's OHLC onto THIS ticker's own date index rather
+        # than assuming the two series line up positionally -- a
+        # ticker that's missing a session SPY has (or vice versa)
+        # would otherwise silently pair up the wrong days.
+        bench_high = spy_df['High'].reindex(df.index)
+        bench_low = spy_df['Low'].reindex(df.index)
+        bench_close = spy_df['Close'].reindex(df.index)
+        rrs_fast_series = _rs_rrs(high, low, close, bench_high, bench_low, bench_close, RS_THRUST_WINDOW)
+        rrs_slow_series = _rs_rrs(high, low, close, bench_high, bench_low, bench_close, RS_ONE_MONTH_WINDOW)
+
+    def _last_valid(s: pd.Series):
+        s = s.dropna()
+        return float(s.iloc[-1]) if len(s) else None
+
+    thrust = _last_valid(rrs_fast_series)     # "RS Thrust" -- the fast/velocity reading
+    onem_rrs = _last_valid(rrs_slow_series)   # "1-Mth RRS" -- the slow/structure reading
+
+    # The histogram plots the trailing window of the SLOW RRS series
+    # itself -- the exact same series "1-Mth RRS" is read from, not a
+    # derived change or level of something else. RRS is already a
+    # genuinely signed "how far above/below expectation" reading at
+    # every date, so the number and the chart are, again, the same
+    # series -- and because real-valued RRS essentially never ties two
+    # days exactly, the single-peak-bar guarantee holds in practice
+    # without needing a banded/bounded reading to force it.
+    hist_series = rrs_slow_series.tail(RS_SPARKLINE_WINDOW).dropna()
+    rs_spark = hist_series.round(4).tolist() if len(hist_series) else []
 
     return {"price": round(last, 2), "pct_1d": pct_1d, "pct_1m": pct_1m,
-            "thrust_return": thrust_return, "pct_off_high": pct_off_high,
+            "pct_off_high": pct_off_high, "thrust": thrust, "onem_rrs": onem_rrs,
             "price_spark": price_spark, "rs_spark": rs_spark}
 
 
-def _rs_percentile_ranks(records: list):
-    """records: list of dicts (or None) sharing one ranking universe
-    (either a whole tab, or -- for RS_Indices_Sectors -- one category
-    block within it, so each section's percentile column reflects only
-    the other rows in that same section). Returns two pandas Series
-    (indexed positionally, read back with Series.get(i)) -- percentile
-    rank (0-100) of thrust_return and of pct_1m, each computed only
-    against the other entries in this same list that actually have
-    that value."""
-    thrust = pd.Series({i: r["thrust_return"] for i, r in enumerate(records)
-                         if r and r.get("thrust_return") is not None})
-    onem = pd.Series({i: r["pct_1m"] for i, r in enumerate(records)
-                       if r and r.get("pct_1m") is not None})
-    return thrust.rank(pct=True) * 100, onem.rank(pct=True) * 100
-
-
-def _rs_row(extra_fields, rec, thrust_pct, onem_pct, i):
+def _rs_row(extra_fields, rec):
+    """Builds one output row. "RS Thrust" and "1-Mth RRS" are both Real
+    Relative Strength (RRS) readings straight off _rs_metrics_for --
+    see _rs_rrs and the RS DASHBOARD header comment -- at two different
+    lookback windows (RS_THRUST_WINDOW / RS_ONE_MONTH_WINDOW). Both are
+    self-referential (or self-vs-SPY) per ticker, so a row's own
+    numbers don't depend on which other tickers happen to be on the
+    same tab or in the same category block. Unlike the old percentile/
+    blend design this replaced, there's no clamping, banding, or
+    blending here -- these are the formula's own raw output, in units
+    of the ticker's own ATR, rounded to 2 decimal places."""
     base = dict(extra_fields)
     if rec is None:
-        base.update({"Price": None, "RS Thrust %": None, "1-Mth RS %": None,
+        base.update({"Price": None, "RS Thrust": None, "1-Mth RRS": None,
                      "1D %": None, "1M %": None, "Off 52W High %": None,
                      "_PriceSpark": [], "_RSSpark": []})
     else:
-        t = thrust_pct.get(i)
-        o = onem_pct.get(i)
+        thrust, onem_rrs = rec["thrust"], rec["onem_rrs"]
         base.update({
             "Price": rec["price"],
-            "RS Thrust %": round(t, 1) if t is not None else None,
-            "1-Mth RS %": round(o, 1) if o is not None else None,
+            "RS Thrust": round(thrust, 2) if thrust is not None else None,
+            "1-Mth RRS": round(onem_rrs, 2) if onem_rrs is not None else None,
             "1D %": rec["pct_1d"], "1M %": rec["pct_1m"], "Off 52W High %": rec["pct_off_high"],
             "_PriceSpark": rec["price_spark"], "_RSSpark": rec["rs_spark"],
         })
@@ -918,21 +1042,20 @@ def run_rs_dashboard():
     blank (price data unavailable) rather than raising, matching this
     project's usual degrade-visibly-not-silently philosophy.
 
-    RS_Groups is ranked as one universe (all ~44 tickers against each
-    other). RS_Indices_Sectors is ranked PER CATEGORY BLOCK (Index vs.
-    Index, Segment vs. Segment, etc.) rather than across all ~40 at
-    once -- this matches that tab's layout, where each category is its
-    own self-contained mini-table (own repeated header row) so it can
-    be sorted independently without disturbing the others; a shared,
-    sheet-wide percentile wouldn't make sense to sort that way."""
-    all_tickers = sorted(set([t for t, _ in RS_GROUPS] + [t for _, t, _ in RS_INDICES_SECTORS]))
+    Both "RS Thrust" and "1-Mth RRS" are Real Relative Strength (RRS)
+    readings, self-referential (or self-vs-SPY) per ticker (see
+    _rs_rrs) -- a row's numbers don't depend on any other row, so
+    RS_Groups and RS_Indices_Sectors don't need separate whole-tab vs.
+    per-category ranking universes here; each ticker is just computed
+    on its own."""
+    all_tickers = sorted(set([t for t, _ in RS_GROUPS] + [t for _, t, _ in RS_INDICES_SECTORS] + ["SPY"]))
     history = _fetch_rs_history(all_tickers)
+    spy_df = history.get("SPY")  # full OHLC DataFrame -- RRS needs SPY's High/Low too, not just Close
 
-    g_records = [(_rs_metrics_for(history[ticker]) if ticker in history else None) for ticker, _ in RS_GROUPS]
-    g_thrust_pct, g_onem_pct = _rs_percentile_ranks(g_records)
+    g_records = [(_rs_metrics_for(history[ticker], spy_df, ticker) if ticker in history else None) for ticker, _ in RS_GROUPS]
     groups_df = pd.DataFrame([
-        _rs_row({"Ticker": ticker, "Name": name}, rec, g_thrust_pct, g_onem_pct, i)
-        for i, ((ticker, name), rec) in enumerate(zip(RS_GROUPS, g_records))
+        _rs_row({"Ticker": ticker, "Name": name}, rec)
+        for (ticker, name), rec in zip(RS_GROUPS, g_records)
     ])
 
     indices_rows = []
@@ -940,20 +1063,15 @@ def run_rs_dashboard():
     cat_rows = []  # [(ticker, name, rec), ...] for the category currently being accumulated
 
     def flush_category():
-        if not cat_rows:
-            return
-        cat_records = [r for _, _, r in cat_rows]
-        thrust_pct, onem_pct = _rs_percentile_ranks(cat_records)
-        for i, (ticker, name, rec) in enumerate(cat_rows):
-            indices_rows.append(_rs_row({"Category": current_category, "Ticker": ticker, "Name": name},
-                                         rec, thrust_pct, onem_pct, i))
+        for ticker, name, rec in cat_rows:
+            indices_rows.append(_rs_row({"Category": current_category, "Ticker": ticker, "Name": name}, rec))
 
     for category, ticker, name in RS_INDICES_SECTORS:
         if category != current_category:
             flush_category()
             cat_rows = []
             current_category = category
-        rec = _rs_metrics_for(history[ticker]) if ticker in history else None
+        rec = _rs_metrics_for(history[ticker], spy_df, ticker) if ticker in history else None
         cat_rows.append((ticker, name, rec))
     flush_category()
     indices_df = pd.DataFrame(indices_rows)
@@ -1027,14 +1145,19 @@ PERCENT_COLUMNS = {
     '% Above 52W Low', '1M Volatility %',
     # RS Dashboard tabs (RS_Groups / RS_Indices_Sectors) -- these reuse
     # '1D %'/'1M %' above directly since they mean the same thing, and
-    # add these three of their own.
-    'RS Thrust %', '1-Mth RS %', 'Off 52W High %',
+    # add this one of their own. "RS Thrust" and "1-Mth RRS" are NOT
+    # percentages -- see RATIO_COLUMNS below.
+    'Off 52W High %',
 }
 # Abbreviated (K/M/B) dollar formats, per the user's request
 ABBREVIATED_CURRENCY_COLUMNS = {'Market Cap', '$ Volume'}
 INTEGER_COLUMNS = {'Volume', 'Float'}
 PRICE_COLUMNS = {'Price'}
-RATIO_COLUMNS = {'Relative Volume'}
+# "RS Thrust" / "1-Mth RRS" are Real Relative Strength readings (see the
+# RS DASHBOARD header comment) -- a volatility-adjusted excess move,
+# expressed in units of the ticker's own ATR, not a percentage. The
+# "x" suffix reads naturally as "2.35 ATRs of excess move."
+RATIO_COLUMNS = {'Relative Volume', 'RS Thrust', '1-Mth RRS'}
 
 ABBREVIATED_CURRENCY_FORMAT = '[>=1000000000]$#,##0.0,,,"B";[>=1000000]$#,##0.0,,"M";$#,##0.0,"K"'
 
@@ -1281,7 +1404,7 @@ def write_metric_sheet(workbook, fmt_cache: dict, sheet_name: str, df: pd.DataFr
 # sheet, so each block can be selected and sorted independently.
 # ---------------------------------------------------------------------
 
-RS_TAB_HEADERS = ["Ticker", "Name", "RS Thrust %", "1-Mth RS %", "1-Mth Chart",
+RS_TAB_HEADERS = ["Ticker", "Name", "RS Thrust", "1-Mth RRS", "1-Mth Chart",
                    "1-Mth RS", "1D %", "1M %", "Off 52W High %", "Price"]
 (RS_COL_TICKER, RS_COL_NAME, RS_COL_THRUST, RS_COL_1MRS, RS_COL_SPARK_PRICE,
  RS_COL_SPARK_RS, RS_COL_1D, RS_COL_1M, RS_COL_OFFHIGH, RS_COL_PRICE) = range(len(RS_TAB_HEADERS))
@@ -1303,12 +1426,36 @@ def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int):
     tab) only supports ONE range per worksheet, which is exactly why
     RS_Indices_Sectors' category sections weren't independently sortable
     before -- a Table object has no such limit, so each category (and
-    RS_Groups' one block) gets its own. style/banded_* are all turned
-    off so the table only adds the header's filter buttons and doesn't
-    paint over the zebra striping and color scales already written."""
+    RS_Groups' one block) gets its own.
+
+    The table's range covers ALL of this block's columns -- the visible
+    ones AND the hidden sparkline-source helper columns out at
+    RS_PRICE_DATA_START_COL/RS_RS_DATA_START_COL -- not just the
+    visible ones. This matters because Excel's own Table sort (the
+    dropdown arrows this function adds) only reorders columns that are
+    actually part of the table; anything outside its range is left
+    exactly where it was. The hidden helper columns are what each row's
+    sparklines read from (see _rs_add_sparklines) -- leaving them out of
+    the table was the bug: sorting by any visible column reordered the
+    visible cells (ticker, RS Thrust, etc.) while every sparkline stayed
+    anchored to its original row and kept reading the OLD data still
+    sitting there, so charts didn't travel with their own ticker after a
+    sort. Including the hidden columns in the same table means an Excel
+    sort moves the whole logical row -- visible values and hidden
+    sparkline data together -- so whichever ticker lands in a row brings
+    its own chart data with it.
+
+    style/banded_* are all turned off so the table only adds the
+    header's filter buttons and doesn't paint over the zebra striping
+    and color scales already written. Excel requires every table column
+    to have its own non-blank, unique header string even when the
+    column itself is hidden (see _rs_setup_worksheet) and never shown,
+    so the hidden columns get plain placeholder names."""
     header_fmt = _header_format(workbook, fmt_cache)
     columns = [{'header': h, 'header_format': header_fmt} for h in RS_TAB_HEADERS]
-    ws.add_table(header_row, 0, last_data_row, len(RS_TAB_HEADERS) - 1, {
+    columns += [{'header': f"_PriceData{i + 1}", 'header_format': header_fmt} for i in range(RS_SPARKLINE_WINDOW)]
+    columns += [{'header': f"_RSData{i + 1}", 'header_format': header_fmt} for i in range(RS_SPARKLINE_WINDOW)]
+    ws.add_table(header_row, 0, last_data_row, RS_TOTAL_COLS - 1, {
         'columns': columns,
         'style': None,
         'banded_rows': False,
@@ -1355,19 +1502,18 @@ def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool):
 
 def _rs_add_sparklines(ws, row, row_dict: dict):
     """Line sparkline for the trailing month of price (a cyan trendline
-    with a dark-slate marker dot at the period's highest close -- the
-    same dark slate used for the RS histogram's peak bar below, so both
-    "highest point" markers read as one consistent visual language) and
-    a column sparkline for the trailing month's cumulative RS trend (see
-    _rs_metrics_for's rs_spark comment). To match the source dashboard,
-    the RS histogram is ONE color for every bar, not a positive/negative
-    two-tone scheme -- which is possible in the first place because
-    rs_spark is already rebased so its window low sits at zero, so every
-    bar grows upward from one shared baseline rather than a chart with
-    mixed-sign data straddling a zero line. The single exception is the
-    window's peak day, which gets a darker fill via high_point/high_color
-    so it stands out the way the source dashboard's highlighted bar
-    does."""
+    with a dark-slate marker dot at the period's highest close) and a
+    column sparkline of the trailing month's "1-Mth RRS" reading
+    itself, day by day -- see _rs_metrics_for's hist_series comment.
+    Unlike every earlier design tried here, RRS is a genuinely signed
+    quantity (positive = outperforming what its own volatility would
+    predict from SPY's move, negative = underperforming), so the
+    histogram is two-tone: slate-blue bars above zero, orange bars
+    below -- the same two colors this workbook already uses as the
+    high/low ends of every percent column's color scale -- with the
+    single tallest (most positive, or least negative) bar in the
+    window additionally darkened to dark slate so "today vs. its own
+    recent RRS range" still reads at a glance."""
     # show_hidden=True is not optional here: Excel does not plot sparkline
     # source data that lives in hidden rows/columns unless told to (the
     # "Show data in hidden rows and columns" sparkline setting, off by
@@ -1390,7 +1536,9 @@ def _rs_add_sparklines(ws, row, row_dict: dict):
         ws.add_sparkline(row, RS_COL_SPARK_RS, {
             'range': xlsxwriter.utility.xl_range(row, RS_RS_DATA_START_COL, row, RS_RS_DATA_START_COL + len(rs_spark) - 1),
             'type': 'column',
-            'series_color': _hex(COLOR_ACCENT_CYAN),
+            'series_color': _hex(COLOR_SCALE_HIGH),      # positive RRS bars
+            'negative_points': True,
+            'negative_color': _hex(COLOR_SCALE_LOW),     # negative RRS bars
             'high_point': True, 'high_color': _hex(COLOR_HEADER_BG),
             'show_hidden': True,
         })
@@ -1400,8 +1548,9 @@ def _rs_conditional_format(ws, first_row, last_row):
     """The same 3-color scale every other tab's percent columns get (see
     _fit_column), applied to just this row range -- the whole sheet for
     RS_Groups, or one category block at a time for RS_Indices_Sectors,
-    since each block is percentile-ranked (see run_rs_dashboard) and
-    meant to be read against only its own rows."""
+    so each block's coloring is scaled against only its own rows
+    rather than the whole tab (a strong sector shouldn't all read as
+    "average" just because a stronger one sits elsewhere on the tab)."""
     if last_row < first_row:
         return
     for col_idx in (RS_COL_THRUST, RS_COL_1MRS, RS_COL_1D, RS_COL_1M, RS_COL_OFFHIGH):
@@ -1443,10 +1592,17 @@ def _rs_write_block(ws, workbook, fmt_cache, df: pd.DataFrame, start_row: int) -
 
 
 def write_rs_groups_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
-    """RS_Groups: one flat, self-sortable table (all ~44 tickers ranked
-    against each other -- see run_rs_dashboard)."""
+    """RS_Groups: one flat, self-sortable table (all ~45 tickers, each
+    scored independently -- see run_rs_dashboard).
+
+    Default row order: sorted by 1-Mth RRS (then RS Thrust as a
+    tiebreaker), descending -- strongest trend-vs-expectation first.
+    This is only the file's DEFAULT order -- the sortable header (see
+    _rs_add_table) lets it be re-sorted by hand at any time."""
     if df is None or df.empty:
         return None
+    df = df.sort_values(by=["1-Mth RRS", "RS Thrust"], ascending=False,
+                         na_position="last", kind="stable")
     ws = workbook.add_worksheet('RS_Groups')
     _rs_setup_worksheet(ws)
     ws.freeze_panes(1, 2)
@@ -1455,15 +1611,29 @@ def write_rs_groups_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
     return ws
 
 
+# Categories whose row order is left exactly as configured in
+# RS_INDICES_SECTORS rather than default-sorted. Segment is
+# deliberately kept in small-to-large-cap order (IJS/IJR/IJT ->
+# IJJ/IJH/IJK -> IVE/IVV/IVW) so the progression across cap sizes stays
+# visually intact -- sorting it by score would scramble that. Every
+# other category is sorted (see write_rs_indices_sheet) by 1-Mth RRS
+# first, RS Thrust as the tiebreaker. This is only the file's DEFAULT
+# row order -- the sortable header on every block (see _rs_add_table)
+# lets it be re-sorted by hand at any time.
+RS_UNSORTED_CATEGORIES = {"Segment"}
+
+
 def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
     """RS_Indices_Sectors: one mini-table per category (Index / Segment /
-    EW Sector / SPDR Sector), each with its own repeated header row and
-    its own percentile ranking, separated by a merged category banner
-    row -- matching the source dashboard's layout instead of a single
-    flat table with a 'Category' column. Row freezing is column-only
-    (not row-only) because the header row's position shifts from block
-    to block, so freezing a fixed row wouldn't keep every block's own
-    header in view the way it does on RS_Groups."""
+    EW Sector / SPDR Sector), each with its own repeated header row --
+    every ticker is scored independently (see run_rs_dashboard), so
+    there's no shared ranking universe a category block needs to stay
+    separate for; the split is purely for the layout -- separated by a
+    merged category banner row instead of a single flat table with a
+    'Category' column. Row freezing is column-only (not row-only)
+    because the header row's position shifts from block to block, so
+    freezing a fixed row wouldn't keep every block's own header in
+    view the way it does on RS_Groups."""
     if df is None or df.empty:
         return None
     ws = workbook.add_worksheet('RS_Indices_Sectors')
@@ -1477,6 +1647,9 @@ def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
     row = 0
     for category in df['Category'].drop_duplicates():
         block = df[df['Category'] == category]
+        if category not in RS_UNSORTED_CATEGORIES:
+            block = block.sort_values(by=["1-Mth RRS", "RS Thrust"], ascending=False,
+                                       na_position="last", kind="stable")
         if row > 0:
             row += 1  # blank separator row between category blocks
         ws.merge_range(row, 0, row, len(RS_TAB_HEADERS) - 1, str(category), category_fmt)
