@@ -1,16 +1,49 @@
 import concurrent.futures
+import numbers
 import re
 from tradingview_screener import Query, col
 import pandas as pd
 import yfinance as yf
 from finvizfinance.screener.custom import Custom
+from finvizfinance.constants import filter_dict as _finviz_filter_dict
 import logging
 from datetime import datetime
 
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.formatting.rule import ColorScaleRule, CellIsRule
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+import xlsxwriter
+
+# Excel output now goes through xlsxwriter directly (not openpyxl, and not
+# pandas' ExcelWriter wrapper) -- the one thing openpyxl categorically
+# cannot do, at any version, is WRITE native Excel sparklines (it can't
+# even fully read them back -- see the "Sparkline Group extension is not
+# supported" warning openpyxl itself prints on a file that has them). The
+# RS Dashboard tabs' in-cell trend charts need that, so every tab in this
+# workbook is now built with direct write() calls into an xlsxwriter
+# Workbook rather than styling a DataFrame after pandas dumps it in.
+
+# finvizfinance (as installed, v1.5.0) is missing "Sales growth ttm" from
+# its filter table -- confirmed this is a real, live Finviz filter (its
+# own screener UI has it, and the URL it generates uses the code
+# "fa_salesyoyttm_<code>"), the library itself just never added it. Patch
+# it into the SAME dict object the library's screener code reads from
+# (mutating in place, not reassigning, so the library's own imported
+# reference picks it up too), using the identical option codes as its
+# "EPS growth ttm" entry -- Finviz uses this same neg/pos/poslow/high/
+# u5-u30/o5-o30 convention across all of its growth-rate filters.
+if 'Sales growth ttm' not in _finviz_filter_dict:
+    _finviz_filter_dict['Sales growth ttm'] = {
+        'prefix': 'fa_salesyoyttm',
+        'option': {
+            'Any': '',
+            'Negative (<0%)': 'neg',
+            'Positive (>0%)': 'pos',
+            'Positive Low (0-10%)': 'poslow',
+            'High (>25%)': 'high',
+            'Under 5%': 'u5', 'Under 10%': 'u10', 'Under 15%': 'u15',
+            'Under 20%': 'u20', 'Under 25%': 'u25', 'Under 30%': 'u30',
+            'Over 5%': 'o5', 'Over 10%': 'o10', 'Over 15%': 'o15',
+            'Over 20%': 'o20', 'Over 25%': 'o25', 'Over 30%': 'o30',
+        },
+    }
 
 # =====================================================================
 # STANDARDIZED METRIC COLUMNS
@@ -216,6 +249,40 @@ momentum_scans = {
         "extra_fields": ['SMA10'],
         "where": lambda: [col('type') == 'stock', col('exchange').isin(['NASDAQ', 'NYSE', 'AMEX']), col('market_cap_basic') > 10_000_000_000, col('average_volume_60d_calc') > 300_000, col('volume') > 100_000, col('float_shares_outstanding') < 150_000_000, col('Perf.6M') > 100],
     },
+    # "PEG Delayed Reaction" (Jeff Sun / @jfsrev, TradingView screener) --
+    # names that reported earnings last week, are still liquid/volatile
+    # enough to trade, and haven't necessarily finished reacting to the
+    # print yet. Unlike the 8 scans above, this one's full criteria is
+    # expressed in its own `where` (no separate 52-week-low/SMA10-band
+    # filter), and one condition can't be pushed to TradingView's API at
+    # all: "Price x 60D avg volume > $50M" needs two columns multiplied
+    # together, which this library's Column class has no operator for --
+    # so it's applied locally in run_momentum() instead, after the query.
+    # 'earnings_release_trading_date_fq' (last reported earnings date) is
+    # this project's best inference from the confirmed, symmetric
+    # 'earnings_release_next_trading_date_fq' field already documented in
+    # the tradingview_screener library -- if TradingView rejects it,
+    # run_momentum() automatically retries this one scan without the
+    # earnings-date condition and prints a warning rather than losing it.
+    "Mom_PEG_Delayed_Reaction": {
+        "mcap_group": "> $1B", "timeframe": "Post-Earnings (PEG Delayed)",
+        "extra_fields": ['ADR', 'average_volume_60d_calc'],
+        "where": lambda: [
+            col('type') == 'stock',
+            col('exchange').isin(['NASDAQ', 'NYSE', 'AMEX']),
+            col('market_cap_basic') > 1_000_000_000,
+            col('ADR') > 4,
+            col('average_volume_60d_calc') > 2_000_000,
+            col('earnings_release_trading_date_fq').in_week_range(-1, -1),
+        ],
+        "where_fallback": lambda: [
+            col('type') == 'stock',
+            col('exchange').isin(['NASDAQ', 'NYSE', 'AMEX']),
+            col('market_cap_basic') > 1_000_000_000,
+            col('ADR') > 4,
+            col('average_volume_60d_calc') > 2_000_000,
+        ],
+    },
 }
 
 # 3. Finviz Scan Configuration (filters only -- columns are fixed for
@@ -243,31 +310,54 @@ finviz_scans = {
         'Performance 2': 'Quarter +30%',
         '200-Day Simple Moving Average': 'Price above SMA200',
         '50-Day Simple Moving Average': 'Price above SMA50'
-    }
+    },
+    # "High-Velocity Quality Screener" (Jeff Sun / @jfsrev) -- large-cap
+    # quality-growth names: reasonable valuation, positive/growing
+    # earnings and sales, strong balance sheet and margins, in a
+    # confirmed long-term uptrend. 'Sales growth ttm' is patched into
+    # finvizfinance's filter table above since the library doesn't ship
+    # it natively even though it's a real, live Finviz filter.
+    "Finviz_High_Velocity_Quality": {
+        'Market Cap.': '+Large (over $10bln)',
+        'P/E': 'Under 40',
+        'Forward P/E': 'Under 25',
+        'PEG': 'Under 2',
+        'EPS growthnext year': 'Positive (>0%)',
+        'EPS growthpast 5 years': 'Positive (>0%)',
+        'Sales growthqtr over qtr': 'Positive (>0%)',
+        'Sales growth ttm': 'Over 10%',
+        'Return on Investment': 'Over +10%',
+        'Current Ratio': 'Over 1',
+        'LT Debt/Equity': 'Under 1',
+        'Gross Margin': 'Over 15%',
+        'Operating Margin': 'Positive (>0%)',
+        'Net Profit Margin': 'Positive (>0%)',
+        '200-Day Simple Moving Average': 'Price above SMA200',
+        'Current Volume': 'Over 0',
+    },
 }
 
 leveraged_tickers = [
-    "TQQQ", "SOXX", "QLD", "SSO", "SPXL", "FNGU", "TECL", "UPRO", "NVDL", "MUU",
-    "TSLL", "BULZ", "USD", "FAS", "TMF", "SNXX", "AGQ", "KORU", "GDXU", "ROM",
-    "NUGT", "TNA", "GGLL", "AMDL", "UDOW", "UGL", "UYG", "FNGO", "YINN", "MSFU",
-    "MULL", "LABU", "CONL", "DDM", "TSMX", "NAIL", "SPYU", "NVDU", "JNUG", "METU",
-    "PLTU", "NVDX", "UCO", "BOIL", "BMNU", "MVLL", "PTIR", "DPST", "DFEN",
-    "INTW", "SPCH", "URTY", "AMZU", "SPUU", "SNDU", "ERX", "NOWL", "MSTX", "ASTX",
-    "UWM", "IRE", "DGP", "GUSH", "AVL", "MQQQ", "AAOX", "ORCX", "LITX", "UVIX",
-    "CWEB", "NBIL", "FBL", "CURE", "EDC", "CRCG", "SKUU", "AAPU", "BEX", "NEBX",
-    "TSLT", "SMCX", "NFXL", "MVV", "RKLX", "CRCA", "BABX", "ORCU", "DLLL", "IONX",
-    "FNGG", "SHNY", "SNDG", "OKLL", "CRWG", "NVII", "MRVU", "GDXD", "BRZU", "BIB",
-    "CBRG", "ROBN", "WEBL", "COHX", "APPX", "WDCX", "CHAU", "RXL", "SKHX", "NRGU",
-    "OILU", "DIG", "CWVX", "HIBL", "QQQU", "CRDU", "MSFL", "NBIG", "TSLR", "CRMG",
-    "AMUU", "MSOX", "MIDU", "HOOG", "LOFF", "MAGX", "UBT", "LINT", "QBTX", "LABX",
-    "TDAX", "IREX", "IONL", "CRWL", "URSP", "INDL", "QCML", "URE", "SOFX", "RDTL",
-    "SPCU", "ARMG", "XUSP", "TSLG", "FNGD", "HIMZ", "CCUP", "GOOX", "LVLN", "SMU",
-    "EURL", "TSMU", "DUSL", "AVGG", "BMNG", "APLX", "VRTL", "BNKU", "UTSL", "DRN",
-    "AMZZ", "NVDG", "IBX", "BEG", "UYM", "BRKU", "SMCL", "RGTX", "NVTX", "EET",
-    "MRAL", "LRCU", "TEMT", "ADBG", "MRNX", "PALU", "SPAL", "URAA", "NVOX", "QPUX",
-    "NFLU", "UMDD", "MVPL", "TSMG", "RDWU", "AVGU", "TSII", "ASMI", "ASMG", "ONDL",
-    "AMA", "SAA", "CRWU", "QQUP", "EFO", "UXI", "GEVX", "GEVD", "TYD", "PLTG",
-    "LNOK", "IREG"
+    "TQQQ", "SOXL", "QLD", "SSO", "FNGU", "SPXL", "TECL", "UPRO", "TSLL", "NVDL",
+    "MUU", "BULZ", "USD", "TMF", "FAS", "SNXX", "AGQ", "ROM", "GDXU", "TNA",
+    "NUGT", "KORU", "GGLL", "AMDL", "UGL", "UDOW", "UYG", "FNGO", "MULL", "YINN",
+    "TSMX", "SPYU", "NAIL", "MSFU", "MSTU", "DDM", "LABU", "METU", "NVDU", "CONL",
+    "JNUG", "UCO", "NVDX", "PLTU", "BOIL", "BMNU", "MVLL", "SNDU", "DPST", "SPCH",
+    "PTIR", "IRE", "DFEN", "URTY", "SPUU", "INTW", "AMZU", "MQQQ", "MSTX", "ERX",
+    "AVL", "AAOX", "GUSH", "ASTX", "ORCX", "NOWL", "UWM", "DGP", "BEX", "FBL",
+    "SKUU", "DLLL", "AAPU", "RKLX", "NBIL", "CWEB", "UVIX", "CURE", "EDC", "ORCU",
+    "LITX", "TSLT", "MVV", "NFXL", "IONX", "CRCA", "NEBX", "GDXD", "CRCG", "ROBN",
+    "FNGG", "SMCX", "NVII", "BRZU", "MRVU", "BABX", "SKHX", "CRWG", "SHNY", "SNDG",
+    "OKLL", "CRDU", "WEBL", "RXL", "DIG", "BIB", "CHAU", "NRGU", "COHX", "CRWL",
+    "NBIG", "OILU", "WDCX", "CBRG", "APPX", "LOFF", "TSLR", "QQQU", "AMUU", "HIBL",
+    "QCML", "GOOX", "LINT", "MSOX", "QBTX", "MSFL", "TDAX", "SPCU", "MAGX", "HOOG",
+    "MIDU", "IONL", "CWVX", "RDTL", "CRMG", "UBT", "HIMZ", "IREX", "SOFX", "FNGD",
+    "ARMG", "URE", "INDL", "XUSP", "BMNG", "LVLN", "SMU", "BEG", "LABX", "EET",
+    "AVGG", "UTSL", "MRAL", "EURL", "TSLG", "APLX", "PALU", "BNKU", "DUSL", "TSMU",
+    "BRKU", "URSP", "RGTX", "SPAL", "DRN", "VRTL", "SMCL", "CCUP", "NVDG", "UYM",
+    "AMZZ", "TEMT", "ADBG", "IBX", "AVGU", "GEVX", "NVOX", "MVPL", "QPUX", "RDWU",
+    "TSMG", "TSII", "ONDL", "LNOK", "URAA", "NVTX", "LRCU", "IREG", "EFO", "UMDD",
+    "ASMG", "OILD", "QCMU", "TYD", "SAA", "QQUP", "NFLU", "UXI", "AMA", "SMHU",
 ]
 
 
@@ -413,23 +503,50 @@ def run_individual(name, spec):
 
 def run_momentum(key, info):
     fields = info.get('extra_fields', []) + STANDARD_DISPLAY_FIELDS
+    where_conditions = info['where']()
+    df = None
     try:
-        query = _build_query(fields, info['where'](), 'change', False, 300)
+        query = _build_query(fields, where_conditions, 'change', False, 300)
         _, df = query.get_scanner_data()
     except Exception as e:
-        print(f"Warning: full field set failed for momentum {key} ({e}); retrying with a reduced field set.")
-        try:
-            fallback_fields = info.get('extra_fields', []) + SAFE_FALLBACK_FIELDS
-            query = _build_query(fallback_fields, info['where'](), 'change', False, 300)
-            _, df = query.get_scanner_data()
-        except Exception as e2:
-            print(f"Error in momentum {key}: {e2}")
-            return key, pd.DataFrame()
+        # Scans with a 'where_fallback' (currently just Mom_PEG_Delayed_Reaction)
+        # get one extra retry tier: drop the condition this project is least
+        # sure of (an inferred TradingView field name) before falling back
+        # to a reduced field set like every other scan does.
+        if 'where_fallback' in info:
+            print(f"Warning: momentum {key}'s where clause failed ({e}); "
+                  f"retrying without its least-certain condition -- results "
+                  f"will be broader than intended until that's confirmed.")
+            try:
+                where_conditions = info['where_fallback']()
+                query = _build_query(fields, where_conditions, 'change', False, 300)
+                _, df = query.get_scanner_data()
+            except Exception as e2:
+                e = e2
+
+        if df is None:
+            print(f"Warning: full field set failed for momentum {key} ({e}); retrying with a reduced field set.")
+            try:
+                fallback_fields = info.get('extra_fields', []) + SAFE_FALLBACK_FIELDS
+                query = _build_query(fallback_fields, where_conditions, 'change', False, 300)
+                _, df = query.get_scanner_data()
+            except Exception as e3:
+                print(f"Error in momentum {key}: {e3}")
+                return key, pd.DataFrame()
 
     try:
         if not df.empty:
-            low_mult = 0.80 if not info['is_large'] else 0.90
-            df = df[(df['close'] >= df['price_52_week_low'] * 1.50) & (df['SMA10'] <= df['close']) & (df['SMA10'] >= df['close'] * low_mult)].copy()
+            if key == "Mom_PEG_Delayed_Reaction":
+                # This scan's own where() already expresses its full
+                # criteria -- the only piece that can't be pushed to
+                # TradingView's API is "Price x 60D avg volume > $50M"
+                # (no arithmetic-between-columns filter exists there), so
+                # it's applied locally here instead.
+                if 'average_volume_60d_calc' in df.columns:
+                    df = df[(df['close'] * df['average_volume_60d_calc']) > 50_000_000].copy()
+            else:
+                low_mult = 0.80 if not info['is_large'] else 0.90
+                df = df[(df['close'] >= df['price_52_week_low'] * 1.50) & (df['SMA10'] <= df['close']) & (df['SMA10'] >= df['close'] * low_mult)].copy()
             df.insert(0, 'Source_Scan', key)
             df.insert(1, 'Market_Cap_Group', info['mcap_group'])
             df.insert(2, 'Timeframe', info['timeframe'])
@@ -558,6 +675,296 @@ def run_finviz_scan(name, filters_dict):
 
 
 # =====================================================================
+# RS DASHBOARD (RS_Groups / RS_Indices_Sectors tabs)
+# ---------------------------------------------------------------------
+# A "reasonable facsimile" of Jeff Sun's (@jfsrev) thematic-ETF and
+# index/sector relative-strength dashboards on X/Twitter. His
+# "RS Thrust Rate %" and "1-Mth RS %" are his own proprietary scoring
+# with no published formula -- what's computed below under the same
+# names is a transparent stand-in, not a reproduction of his exact
+# numbers:
+#
+#   RS Thrust %   = percentile rank, within this tab's own ticker list
+#                   only, of each ticker's trailing RS_THRUST_WINDOW
+#                   (5) trading-day price return. Short lookback, so
+#                   it reflects who's accelerating right now.
+#   1-Mth RS %    = percentile rank, within this tab's own ticker list
+#                   only, of each ticker's trailing RS_ONE_MONTH_WINDOW
+#                   (21) trading-day price return. Longer lookback, a
+#                   smoother trend read.
+#
+# This is the same spirit as IBD's classic Relative Strength Rating --
+# a percentile against the peer universe on the same tab, not a ratio
+# against any single benchmark ticker -- which is also why SPY/TLT can
+# show different scores on each tab they appear on, and why a strong
+# stretch for the whole list can push many names to 100% at once (it's
+# a percentile, not a fixed bar).
+# =====================================================================
+
+RS_THRUST_WINDOW = 5
+RS_ONE_MONTH_WINDOW = 21
+
+# Fixed watchlist order (not resorted by score), matching the source
+# dashboard's own row order.
+RS_GROUPS = [
+    ("BUG", "Pure Cybersecurity Software"),
+    ("CIBR", "Cybersecurity Software & Infra"),
+    ("BOAT", "Global Shipping"),
+    ("CLOU", "Cloud Infrastructure & SaaS"),
+    ("MAGS", "Magnificent 7"),
+    ("WOOD", "Timber & Lumber"),
+    ("TLT", "20+ Year Treasury Bonds"),
+    ("ARKG", "ARK Genomics"),
+    ("FDN", "US Internet Giants"),
+    ("AIQ", "AI Software & Data Processing"),
+    ("SVIX", "Short VIX Futures (Volatility)"),
+    ("BUZZ", "Social Media"),
+    ("NASA", "Space Economy"),
+    ("ARKK", "ARK Innovation"),
+    ("BOTZ", "AI & Robotics"),
+    ("ARKQ", "ARK Robotics"),
+    ("ARKX", "ARK Space Exploration"),
+    ("ROBO", "Robotics & Automation"),
+    ("ARKW", "ARK Internet & Next-Gen Tech"),
+    ("IDGT", "Digital Infrastructure & Data Centers"),
+    ("XSD", "Semiconductors (Equal)"),
+    ("QTUM", "Quantum/AI"),
+    ("PBE", "Dynamic Biotech"),
+    ("CNBS", "Cannabis"),
+    ("HYDR", "Hydrogen Energy & Fuel Cells"),
+    ("BAI", "AI & Tech Active"),
+    ("MEME", "Meme"),
+    ("ESPO", "E-Sports"),
+    ("WCLD", "Cloud Tech"),
+    ("UFO", "Space Industry"),
+    ("SLX", "Steel"),
+    ("SOXX", "Broad Semiconductor"),
+    ("XHS", "Healthcare Facilities & Services"),
+    ("GNR", "Natural Resources"),
+    ("ETHA", "Ether Spot"),
+    ("IBB", "Biotech Megacap"),
+    ("IGV", "US Tech/Software"),
+    ("UNG", "Natural Gas"),
+    ("WGMI", "Internet Services & Infrastructure"),
+    ("IGF", "Global Infrastructure Assets"),
+    ("KIE", "Insurance"),
+    ("MOO", "Global Agricultural Producers"),
+    ("EWZ", "Brazilian Equities"),
+    ("ICLN", "Clean Energy"),
+]
+
+# (category, ticker, name) -- category becomes its own filterable
+# column (via the auto-filter every tab already gets) rather than a
+# merged banner row, so this can go through the exact same generic
+# tab-writing pipeline as everything else.
+RS_INDICES_SECTORS = [
+    ("Index", "RSP", "S&P 500 Equal Weight"),
+    ("Index", "SPY", "S&P 500"),
+    ("Index", "QQQ", "Nasdaq-100"),
+    ("Index", "QQQE", "Nasdaq-100 Equal Weight"),
+    ("Index", "IWM", "Russell 2000"),
+    ("Index", "DIA", "Dow 30"),
+    ("Index", "SPMO", "S&P 500 Momentum"),
+    ("Index", "TLT", "20+ Year Treasury Bonds"),
+    ("Segment", "IJS", "Small-Cap 600 Value"),
+    ("Segment", "IJR", "Small-Cap 600"),
+    ("Segment", "IJT", "Small-Cap 600 Growth"),
+    ("Segment", "IJJ", "MidCap 400 Value"),
+    ("Segment", "IJH", "MidCap 400"),
+    ("Segment", "IJK", "MidCap 400 Growth"),
+    ("Segment", "IVE", "Large-Cap 500 Value"),
+    ("Segment", "IVV", "S&P 500"),
+    ("Segment", "IVW", "Large-Cap 500 Growth"),
+    ("EW Sector", "RSPH", "Equal Weight Health Care"),
+    ("EW Sector", "RSPT", "Equal Weight Technology"),
+    ("EW Sector", "SPY", "S&P 500"),
+    ("EW Sector", "RSPG", "Equal Weight Energy"),
+    ("EW Sector", "RSPC", "Equal Weight Communication"),
+    ("EW Sector", "RSPU", "Equal Weight Utilities"),
+    ("EW Sector", "RSPM", "Equal Weight Material"),
+    ("EW Sector", "RSPR", "Equal Weight Real Estate"),
+    ("EW Sector", "RSPS", "Equal Weight Staples"),
+    ("EW Sector", "RSPN", "Equal Weight Industrial"),
+    ("EW Sector", "RSPF", "Equal Weight Financials"),
+    ("EW Sector", "RSPD", "Equal Weight Discretionary"),
+    ("SPDR Sector", "SPY", "S&P 500"),
+    ("SPDR Sector", "XLV", "Health Care"),
+    ("SPDR Sector", "XLK", "Technology"),
+    ("SPDR Sector", "XLC", "Communication Services"),
+    ("SPDR Sector", "XLP", "Consumer Staples"),
+    ("SPDR Sector", "XLE", "Energy"),
+    ("SPDR Sector", "XLU", "Utilities"),
+    ("SPDR Sector", "XLRE", "Real Estate"),
+    ("SPDR Sector", "XLB", "Materials"),
+    ("SPDR Sector", "XLF", "Financials"),
+    ("SPDR Sector", "XLI", "Industrials"),
+    ("SPDR Sector", "XLY", "Consumer Discretionary"),
+]
+
+
+def _fetch_rs_history(tickers):
+    """Same batched-yfinance-download pattern as run_leveraged_etfs:
+    ~1 year of daily bars in one request, with a per-ticker
+    dropna/min-length guard so one bad symbol can't take down the
+    whole tab. Returns {ticker: DataFrame} for every ticker that came
+    back with enough history; a ticker simply absent from the dict
+    shows up as a blank row later rather than a fabricated one."""
+    logger = yf.utils.get_yf_logger()
+    original_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    history = {}
+    try:
+        data = yf.download(tickers, period="1y", progress=False, group_by='ticker')
+        for t in tickers:
+            try:
+                df = data if len(tickers) == 1 else (data[t] if t in data.columns.levels[0] else pd.DataFrame())
+                df = df.dropna(subset=['Close'])
+                if len(df) >= RS_ONE_MONTH_WINDOW + 1:
+                    history[t] = df
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Warning: RS dashboard's batched download failed ({e}); its tabs will be mostly blank this run.")
+    finally:
+        logger.setLevel(original_level)
+    return history
+
+
+RS_SPARKLINE_WINDOW = 21
+
+
+def _rs_metrics_for(df: pd.DataFrame):
+    """Raw (not-yet-percentile-ranked) fields for one ticker: latest
+    price, 1D/1-Month % change, the short-window return the Thrust
+    percentile is ranked on, % off the trailing 52-week high, and the
+    two trailing-21-session series the RS Dashboard's sparklines draw
+    from."""
+    close = df['Close']
+    last = float(close.iloc[-1])
+    pct_1d = round((last / float(close.iloc[-2]) - 1) * 100, 2) if len(close) >= 2 else None
+    if len(close) > RS_ONE_MONTH_WINDOW:
+        pct_1m = round((last / float(close.iloc[-1 - RS_ONE_MONTH_WINDOW]) - 1) * 100, 2)
+        thrust_return = round((last / float(close.iloc[-1 - RS_THRUST_WINDOW]) - 1) * 100, 2)
+    else:
+        pct_1m = None
+        thrust_return = None
+    week52_high = float(close.tail(min(len(close), 252)).max())
+    pct_off_high = round((last / week52_high - 1) * 100, 2) if week52_high else None
+    price_spark = close.tail(RS_SPARKLINE_WINDOW).astype(float).tolist()
+
+    # The "1-Mth RS" histogram's source series -- deliberately NOT
+    # day-over-day % change. A plain return series is positive about as
+    # often as it's negative, so a column sparkline of it draws bars both
+    # above AND below a zero line with two alternating colors -- not what
+    # the source dashboard's histogram looks like (a single-color shape
+    # that only ever grows up from a zero baseline, with one darker bar
+    # marking its peak). What actually produces that shape is the
+    # window's CUMULATIVE return trajectory (each day vs. the start of
+    # the window), rebased so the window's own low point sits at zero.
+    # The tallest bar then naturally lands on the day the ticker's RS
+    # trend actually peaked within the month -- the same idea as the
+    # price chart's high-point dot, just for the cumulative RS line.
+    window_prices = close.tail(RS_SPARKLINE_WINDOW + 1)
+    if len(window_prices) >= 2:
+        cum_pct = (window_prices / float(window_prices.iloc[0]) - 1) * 100
+        cum_pct = cum_pct.iloc[1:]  # drop the leading, always-zero start-of-window point
+        rs_spark = (cum_pct - cum_pct.min()).round(3).tolist()
+    else:
+        rs_spark = []
+
+    return {"price": round(last, 2), "pct_1d": pct_1d, "pct_1m": pct_1m,
+            "thrust_return": thrust_return, "pct_off_high": pct_off_high,
+            "price_spark": price_spark, "rs_spark": rs_spark}
+
+
+def _rs_percentile_ranks(records: list):
+    """records: list of dicts (or None) sharing one ranking universe
+    (either a whole tab, or -- for RS_Indices_Sectors -- one category
+    block within it, so each section's percentile column reflects only
+    the other rows in that same section). Returns two pandas Series
+    (indexed positionally, read back with Series.get(i)) -- percentile
+    rank (0-100) of thrust_return and of pct_1m, each computed only
+    against the other entries in this same list that actually have
+    that value."""
+    thrust = pd.Series({i: r["thrust_return"] for i, r in enumerate(records)
+                         if r and r.get("thrust_return") is not None})
+    onem = pd.Series({i: r["pct_1m"] for i, r in enumerate(records)
+                       if r and r.get("pct_1m") is not None})
+    return thrust.rank(pct=True) * 100, onem.rank(pct=True) * 100
+
+
+def _rs_row(extra_fields, rec, thrust_pct, onem_pct, i):
+    base = dict(extra_fields)
+    if rec is None:
+        base.update({"Price": None, "RS Thrust %": None, "1-Mth RS %": None,
+                     "1D %": None, "1M %": None, "Off 52W High %": None,
+                     "_PriceSpark": [], "_RSSpark": []})
+    else:
+        t = thrust_pct.get(i)
+        o = onem_pct.get(i)
+        base.update({
+            "Price": rec["price"],
+            "RS Thrust %": round(t, 1) if t is not None else None,
+            "1-Mth RS %": round(o, 1) if o is not None else None,
+            "1D %": rec["pct_1d"], "1M %": rec["pct_1m"], "Off 52W High %": rec["pct_off_high"],
+            "_PriceSpark": rec["price_spark"], "_RSSpark": rec["rs_spark"],
+        })
+    return base
+
+
+def run_rs_dashboard():
+    """Builds the RS_Groups and RS_Indices_Sectors tabs. Returns
+    (groups_df, indices_df); either can come back with some/all rows
+    blank (price data unavailable) rather than raising, matching this
+    project's usual degrade-visibly-not-silently philosophy.
+
+    RS_Groups is ranked as one universe (all ~44 tickers against each
+    other). RS_Indices_Sectors is ranked PER CATEGORY BLOCK (Index vs.
+    Index, Segment vs. Segment, etc.) rather than across all ~40 at
+    once -- this matches that tab's layout, where each category is its
+    own self-contained mini-table (own repeated header row) so it can
+    be sorted independently without disturbing the others; a shared,
+    sheet-wide percentile wouldn't make sense to sort that way."""
+    all_tickers = sorted(set([t for t, _ in RS_GROUPS] + [t for _, t, _ in RS_INDICES_SECTORS]))
+    history = _fetch_rs_history(all_tickers)
+
+    g_records = [(_rs_metrics_for(history[ticker]) if ticker in history else None) for ticker, _ in RS_GROUPS]
+    g_thrust_pct, g_onem_pct = _rs_percentile_ranks(g_records)
+    groups_df = pd.DataFrame([
+        _rs_row({"Ticker": ticker, "Name": name}, rec, g_thrust_pct, g_onem_pct, i)
+        for i, ((ticker, name), rec) in enumerate(zip(RS_GROUPS, g_records))
+    ])
+
+    indices_rows = []
+    current_category = None
+    cat_rows = []  # [(ticker, name, rec), ...] for the category currently being accumulated
+
+    def flush_category():
+        if not cat_rows:
+            return
+        cat_records = [r for _, _, r in cat_rows]
+        thrust_pct, onem_pct = _rs_percentile_ranks(cat_records)
+        for i, (ticker, name, rec) in enumerate(cat_rows):
+            indices_rows.append(_rs_row({"Category": current_category, "Ticker": ticker, "Name": name},
+                                         rec, thrust_pct, onem_pct, i))
+
+    for category, ticker, name in RS_INDICES_SECTORS:
+        if category != current_category:
+            flush_category()
+            cat_rows = []
+            current_category = category
+        rec = _rs_metrics_for(history[ticker]) if ticker in history else None
+        cat_rows.append((ticker, name, rec))
+    flush_category()
+    indices_df = pd.DataFrame(indices_rows)
+
+    n_priced = sum(1 for r in g_records if r is not None) + sum(1 for row in indices_rows if row.get("Price") is not None)
+    n_total = len(g_records) + len(indices_rows)
+    print(f"Finished RS Dashboard: {n_priced}/{n_total} tickers priced.")
+    return groups_df, indices_df
+
+
+# =====================================================================
 # EXCEL OUTPUT STYLING
 # ---------------------------------------------------------------------
 # Everything below controls ONLY how results_dict gets written to the
@@ -608,11 +1015,20 @@ FRIENDLY_NAMES = {
 # 'Scan' (and grouping) columns kept and pinned to the front
 COMBINED_SHEETS = {'All_Scans', 'Momentum'}
 
+# The RS Dashboard tabs (see run_rs_dashboard) -- not a "scan" in the
+# match/no-match sense, so they skip the universal fixed-column pipeline
+# every scan tab shares (see write_styled_workbook).
+RS_DASHBOARD_SHEETS = {'RS_Groups', 'RS_Indices_Sectors'}
+
 # Friendly-name column format buckets
 PERCENT_COLUMNS = {
     '1D %', '1W %', '1M %', '3M %', '6M %', '1Y %',
     'EPS YoY Growth % (Qtr)', 'Revenue YoY Growth % (Qtr)',
     '% Above 52W Low', '1M Volatility %',
+    # RS Dashboard tabs (RS_Groups / RS_Indices_Sectors) -- these reuse
+    # '1D %'/'1M %' above directly since they mean the same thing, and
+    # add these three of their own.
+    'RS Thrust %', '1-Mth RS %', 'Off 52W High %',
 }
 # Abbreviated (K/M/B) dollar formats, per the user's request
 ABBREVIATED_CURRENCY_COLUMNS = {'Market Cap', '$ Volume'}
@@ -630,7 +1046,7 @@ SHEET_DISPLAY_ORDER = [
     "1_Fundamental_Growth", "3_Post_Earnings_Cont_Base",
     "4_Strongest_Stock_JK", "5_Strongest_Stock_10B_Rev_30_JK",
     "Daily_Tightness_Swing", "Leveraged_Setups", "Finviz_High_Short_Float",
-    "Finviz_IPO_Weekly", "Finviz_Steve_Jacobs_RS"
+    "Finviz_IPO_Weekly", "Finviz_Steve_Jacobs_RS", "Finviz_High_Velocity_Quality"
 ]
 
 
@@ -746,142 +1162,386 @@ def _preview_text(value, header: str) -> str:
     return str(value)
 
 
-def style_worksheet(ws: Worksheet, n_rows: int, n_cols: int):
-    """Apply header styling, freeze panes, autofilter, column widths,
-    number formats, zebra striping, and color-scale / status
-    conditional formatting to one already-populated worksheet.
+def _hex(color: str) -> str:
+    return f"#{color}"
 
-    Column widths are fit to the DATA only (not the header text), so
-    columns stay tight even under long headers like "Revenue YoY
-    Growth % (Qtr)". The header row wraps and grows tall enough to
-    stay legible at that width instead."""
+
+def _get_format(workbook, fmt_cache: dict, key, props: dict):
+    """Format objects are meant to be created once and reused in
+    xlsxwriter (unlike openpyxl, where a Font/PatternFill is just a
+    cheap plain object) -- this cache is what makes that possible
+    across the many small format variants (one per number-format x
+    zebra/plain combination) every sheet needs."""
+    if key not in fmt_cache:
+        fmt_cache[key] = workbook.add_format(props)
+    return fmt_cache[key]
+
+
+MIN_COL_WIDTH = 8    # a floor so very-short data (e.g. "MATCH") isn't cramped, and so
+                     # single long header words (e.g. "Relative") don't split mid-word
+MAX_COL_WIDTH = 45   # a safety ceiling for a truly extreme outlier value; long but normal
+                     # text (e.g. a GICS industry name) should still get its real width
+
+
+def _header_format(workbook, fmt_cache):
+    return _get_format(workbook, fmt_cache, ('header',), {
+        'bold': True, 'bg_color': _hex(COLOR_HEADER_BG), 'font_color': _hex(COLOR_HEADER_FONT),
+        'font_size': 11, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+        'bottom': 2, 'bottom_color': _hex(COLOR_ACCENT_CYAN),
+    })
+
+
+def _data_format(workbook, fmt_cache, numfmt, zebra: bool):
+    props = {'num_format': numfmt} if numfmt else {}
+    if zebra:
+        props = dict(props, bg_color=_hex(COLOR_ZEBRA))
+    return _get_format(workbook, fmt_cache, ('data', numfmt, zebra), props)
+
+
+def _write_cell(ws, row, col, value, fmt):
+    if pd.isna(value):
+        ws.write_blank(row, col, None, fmt)
+    elif isinstance(value, numbers.Number):
+        ws.write_number(row, col, float(value), fmt)
+    else:
+        ws.write_string(row, col, str(value), fmt)
+
+
+def _fit_column(ws, workbook, fmt_cache, col_idx, header, values, n_rows, apply_conditional=True):
+    """Shared by every tab: data-only column width, the header's wrapped
+    line count (for row-height calc), and -- when apply_conditional is
+    True -- the color-scale / MATCH-status conditional formatting. Used
+    both by the generic per-scan writer and, per-column, by the RS
+    Dashboard's custom block writer so the two stay visually identical."""
+    data_max_len = max((len(_preview_text(v, header)) for v in values), default=0)
+    width = max(MIN_COL_WIDTH, min(data_max_len + 2, MAX_COL_WIDTH))
+    ws.set_column(col_idx, col_idx, width)
+    header_len = len(str(header)) if header else 0
+    lines_needed = max(1, -(-header_len // max(int(width) - 1, 1)))  # ceil division
+
+    if apply_conditional and n_rows > 0:
+        if header in PERCENT_COLUMNS:
+            ws.conditional_format(1, col_idx, n_rows, col_idx, {
+                'type': '3_color_scale',
+                'min_color': _hex(COLOR_SCALE_LOW), 'mid_color': _hex(COLOR_SCALE_MID), 'max_color': _hex(COLOR_SCALE_HIGH),
+                'min_type': 'min', 'mid_type': 'percentile', 'mid_value': 50, 'max_type': 'max',
+            })
+        if header == 'Status':
+            match_fmt = _get_format(workbook, fmt_cache, ('status', 'match'), {'bg_color': _hex(COLOR_MATCH_FILL)})
+            nomatch_fmt = _get_format(workbook, fmt_cache, ('status', 'nomatch'), {'bg_color': _hex(COLOR_NOMATCH_FILL)})
+            ws.conditional_format(1, col_idx, n_rows, col_idx, {'type': 'cell', 'criteria': 'equal to', 'value': '"MATCH"', 'format': match_fmt})
+            ws.conditional_format(1, col_idx, n_rows, col_idx, {'type': 'cell', 'criteria': 'equal to', 'value': '"NO MATCH"', 'format': nomatch_fmt})
+
+    return lines_needed
+
+
+def write_metric_sheet(workbook, fmt_cache: dict, sheet_name: str, df: pd.DataFrame):
+    """Write one already-finalized (prepare_sheet_df'd) DataFrame as a
+    fully styled tab: header styling, freeze panes, autofilter, column
+    widths, number formats, zebra striping, and color-scale / status
+    conditional formatting. This is the xlsxwriter equivalent of the
+    old openpyxl combo of `df.to_excel()` + `style_worksheet()` --
+    combined into one pass here because xlsxwriter, unlike openpyxl,
+    can't restyle a cell after it's written, so the value and its
+    format have to be written together."""
+    n_rows, n_cols = len(df), len(df.columns)
     if n_rows == 0 or n_cols == 0:
-        return
+        return None
+    ws = workbook.add_worksheet(sheet_name)
+    headers = list(df.columns)
+    header_fmt = _header_format(workbook, fmt_cache)
+    for c, header in enumerate(headers):
+        ws.write(0, c, header, header_fmt)
 
-    header_fill = PatternFill(start_color=COLOR_HEADER_BG, end_color=COLOR_HEADER_BG, fill_type='solid')
-    header_font = Font(bold=True, color=COLOR_HEADER_FONT, size=11)
-    header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    header_border = Border(bottom=Side(style='medium', color=COLOR_ACCENT_CYAN))
-    zebra_fill = PatternFill(start_color=COLOR_ZEBRA, end_color=COLOR_ZEBRA, fill_type='solid')
-
-    headers = []
-    for col_idx in range(1, n_cols + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        headers.append(cell.value)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = header_align
-        cell.border = header_border
-
-    # Zebra striping on data rows
-    for row_idx in range(2, n_rows + 1):
-        if row_idx % 2 == 0:
-            for col_idx in range(1, n_cols + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = zebra_fill
-
-    MIN_COL_WIDTH = 8    # a floor so very-short data (e.g. "MATCH") isn't cramped, and so
-                         # single long header words (e.g. "Relative") don't split mid-word
-    MAX_COL_WIDTH = 45   # a safety ceiling for a truly extreme outlier value; long but normal
-                         # text (e.g. a GICS industry name) should still get its real width
     max_header_lines = 1
-
-    # Per-column number format + data-only width
-    for col_idx, header in enumerate(headers, start=1):
-        col_letter = get_column_letter(col_idx)
-        fmt = _column_format(header)
-        data_max_len = 0
-        for row_idx in range(2, n_rows + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            if fmt:
-                cell.number_format = fmt
-            val_len = len(_preview_text(cell.value, header))
-            if val_len > data_max_len:
-                data_max_len = val_len
-        width = max(MIN_COL_WIDTH, min(data_max_len + 2, MAX_COL_WIDTH))
-        ws.column_dimensions[col_letter].width = width
-
-        header_len = len(str(header)) if header else 0
-        lines_needed = max(1, -(-header_len // max(int(width) - 1, 1)))  # ceil division
+    for c, header in enumerate(headers):
+        numfmt = _column_format(header)
+        plain_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=False)
+        zebra_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=True)
+        col_values = df.iloc[:, c].tolist()
+        for r, value in enumerate(col_values):
+            fmt = zebra_fmt if r % 2 == 0 else plain_fmt
+            _write_cell(ws, r + 1, c, value, fmt)
+        lines_needed = _fit_column(ws, workbook, fmt_cache, c, header, col_values, n_rows)
         max_header_lines = max(max_header_lines, lines_needed)
 
-        # Color-scale conditional formatting on percent-style metric columns
-        if header in PERCENT_COLUMNS and n_rows > 1:
-            rng = f"{col_letter}2:{col_letter}{n_rows}"
-            ws.conditional_formatting.add(
-                rng,
-                ColorScaleRule(
-                    start_type='min', start_color=COLOR_SCALE_LOW,
-                    mid_type='percentile', mid_value=50, mid_color=COLOR_SCALE_MID,
-                    end_type='max', end_color=COLOR_SCALE_HIGH,
-                )
-            )
-
-        # Highlight MATCH / NO MATCH text status (Leveraged_Setups sheet,
-        # and any combined sheet that includes leveraged-ETF rows)
-        if header == 'Status' and n_rows > 1:
-            rng = f"{col_letter}2:{col_letter}{n_rows}"
-            ws.conditional_formatting.add(
-                rng, CellIsRule(operator='equal', formula=['"MATCH"'],
-                                 fill=PatternFill(start_color=COLOR_MATCH_FILL, end_color=COLOR_MATCH_FILL, fill_type='solid'))
-            )
-            ws.conditional_formatting.add(
-                rng, CellIsRule(operator='equal', formula=['"NO MATCH"'],
-                                 fill=PatternFill(start_color=COLOR_NOMATCH_FILL, end_color=COLOR_NOMATCH_FILL, fill_type='solid'))
-            )
-
-    # Grow the header row to fit however many lines its longest wrapped
-    # header needs at the (now data-driven, often narrow) column widths.
-    ws.row_dimensions[1].height = 15 * max_header_lines + 8
-
-    ws.freeze_panes = "B2"
-    ws.auto_filter.ref = ws.dimensions
+    ws.set_row(0, 15 * max_header_lines + 8)
+    ws.freeze_panes(1, 1)
+    ws.autofilter(0, 0, n_rows, n_cols - 1)
+    return ws
 
 
-def write_summary_sheet(writer, sheet_counts: dict, sheet_order: list):
+# ---------------------------------------------------------------------
+# RS Dashboard tabs (RS_Groups / RS_Indices_Sectors -- see
+# run_rs_dashboard). These reuse _hex/_get_format/_data_format/
+# _write_cell/_column_format so their look matches every other tab, but
+# need their own writer for two things write_metric_sheet doesn't do:
+# native per-row sparklines, and (Indices_Sectors only) repeating the
+# header row once per category block instead of once for the whole
+# sheet, so each block can be selected and sorted independently.
+# ---------------------------------------------------------------------
+
+RS_TAB_HEADERS = ["Ticker", "Name", "RS Thrust %", "1-Mth RS %", "1-Mth Chart",
+                   "1-Mth RS", "1D %", "1M %", "Off 52W High %", "Price"]
+(RS_COL_TICKER, RS_COL_NAME, RS_COL_THRUST, RS_COL_1MRS, RS_COL_SPARK_PRICE,
+ RS_COL_SPARK_RS, RS_COL_1D, RS_COL_1M, RS_COL_OFFHIGH, RS_COL_PRICE) = range(len(RS_TAB_HEADERS))
+
+# add_sparkline's 'range' option must point at real cells on the sheet --
+# it can't be fed a literal list of values -- so every row also carries
+# two blocks of hidden helper columns (trailing daily close, then
+# trailing daily % change) that the visible "1-Mth Chart"/"1-Mth RS"
+# cells' sparklines are drawn from.
+RS_PRICE_DATA_START_COL = len(RS_TAB_HEADERS)
+RS_RS_DATA_START_COL = RS_PRICE_DATA_START_COL + RS_SPARKLINE_WINDOW
+RS_TOTAL_COLS = RS_RS_DATA_START_COL + RS_SPARKLINE_WINDOW
+
+
+def _rs_add_table(ws, workbook, fmt_cache, header_row: int, last_data_row: int):
+    """Turn this block's range into a native Excel Table so its header
+    row gets Excel's own sort/filter dropdown arrows, scoped to just
+    this block. A plain autofilter (ws.autofilter(), used by every other
+    tab) only supports ONE range per worksheet, which is exactly why
+    RS_Indices_Sectors' category sections weren't independently sortable
+    before -- a Table object has no such limit, so each category (and
+    RS_Groups' one block) gets its own. style/banded_* are all turned
+    off so the table only adds the header's filter buttons and doesn't
+    paint over the zebra striping and color scales already written."""
+    header_fmt = _header_format(workbook, fmt_cache)
+    columns = [{'header': h, 'header_format': header_fmt} for h in RS_TAB_HEADERS]
+    ws.add_table(header_row, 0, last_data_row, len(RS_TAB_HEADERS) - 1, {
+        'columns': columns,
+        'style': None,
+        'banded_rows': False,
+        'banded_columns': False,
+        'first_column': False,
+        'last_column': False,
+        'autofilter': True,
+    })
+
+
+def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool):
+    """Write one ticker's visible cells (formats matched to the rest of
+    the workbook via _column_format, so e.g. 'Price' and 'Off 52W High %'
+    look identical to their counterparts on a regular scan tab) plus its
+    hidden sparkline-source cells. The sparkline itself is a separate,
+    worksheet-level call (_rs_add_sparklines) -- add_sparkline isn't a
+    per-cell write."""
+    zebra_bg = {'bg_color': _hex(COLOR_ZEBRA)} if zebra else {}
+    for c, header in enumerate(RS_TAB_HEADERS):
+        if header in ("1-Mth Chart", "1-Mth RS"):
+            fmt = _data_format(workbook, fmt_cache, None, zebra)
+            ws.write_blank(row, c, None, fmt)  # the sparkline draws over this blank cell
+            continue
+        value = row_dict.get(header)
+        is_missing = value is None or (isinstance(value, float) and pd.isna(value))
+        if header == "Ticker":
+            fmt = _get_format(workbook, fmt_cache, ('rs', 'ticker', zebra), dict(zebra_bg, bold=True))
+            ws.write_string(row, c, str(value), fmt)
+        elif is_missing:
+            fmt = _get_format(workbook, fmt_cache, ('rs', 'na', zebra),
+                               dict(zebra_bg, align='center', font_color='#999999', italic=True))
+            ws.write_string(row, c, "n/a", fmt)
+        else:
+            numfmt = _column_format(header)
+            fmt = _data_format(workbook, fmt_cache, numfmt, zebra)
+            _write_cell(ws, row, c, value, fmt)
+
+    hidden_fmt = _get_format(workbook, fmt_cache, ('rs', 'hidden'), {'num_format': '0.0000'})
+    for i, v in enumerate(row_dict.get("_PriceSpark") or []):
+        ws.write_number(row, RS_PRICE_DATA_START_COL + i, float(v), hidden_fmt)
+    for i, v in enumerate(row_dict.get("_RSSpark") or []):
+        ws.write_number(row, RS_RS_DATA_START_COL + i, float(v), hidden_fmt)
+
+
+def _rs_add_sparklines(ws, row, row_dict: dict):
+    """Line sparkline for the trailing month of price (a cyan trendline
+    with a dark-slate marker dot at the period's highest close -- the
+    same dark slate used for the RS histogram's peak bar below, so both
+    "highest point" markers read as one consistent visual language) and
+    a column sparkline for the trailing month's cumulative RS trend (see
+    _rs_metrics_for's rs_spark comment). To match the source dashboard,
+    the RS histogram is ONE color for every bar, not a positive/negative
+    two-tone scheme -- which is possible in the first place because
+    rs_spark is already rebased so its window low sits at zero, so every
+    bar grows upward from one shared baseline rather than a chart with
+    mixed-sign data straddling a zero line. The single exception is the
+    window's peak day, which gets a darker fill via high_point/high_color
+    so it stands out the way the source dashboard's highlighted bar
+    does."""
+    # show_hidden=True is not optional here: Excel does not plot sparkline
+    # source data that lives in hidden rows/columns unless told to (the
+    # "Show data in hidden rows and columns" sparkline setting, off by
+    # default) -- and the whole point of RS_PRICE_DATA_START_COL/
+    # RS_RS_DATA_START_COL is that they're hidden helper columns. Without
+    # this, every sparkline on the sheet renders as a blank cell in real
+    # Excel even though the XML and the data are otherwise correct.
+    price_spark = row_dict.get("_PriceSpark") or []
+    rs_spark = row_dict.get("_RSSpark") or []
+    if len(price_spark) >= 2:
+        ws.add_sparkline(row, RS_COL_SPARK_PRICE, {
+            'range': xlsxwriter.utility.xl_range(row, RS_PRICE_DATA_START_COL, row, RS_PRICE_DATA_START_COL + len(price_spark) - 1),
+            'type': 'line', 'weight': 1.25,
+            'series_color': _hex(COLOR_ACCENT_CYAN),
+            'markers': False, 'high_point': True,
+            'high_color': _hex(COLOR_HEADER_BG),  # same dark slate as the RS histogram's peak bar
+            'show_hidden': True,
+        })
+    if len(rs_spark) >= 2:
+        ws.add_sparkline(row, RS_COL_SPARK_RS, {
+            'range': xlsxwriter.utility.xl_range(row, RS_RS_DATA_START_COL, row, RS_RS_DATA_START_COL + len(rs_spark) - 1),
+            'type': 'column',
+            'series_color': _hex(COLOR_ACCENT_CYAN),
+            'high_point': True, 'high_color': _hex(COLOR_HEADER_BG),
+            'show_hidden': True,
+        })
+
+
+def _rs_conditional_format(ws, first_row, last_row):
+    """The same 3-color scale every other tab's percent columns get (see
+    _fit_column), applied to just this row range -- the whole sheet for
+    RS_Groups, or one category block at a time for RS_Indices_Sectors,
+    since each block is percentile-ranked (see run_rs_dashboard) and
+    meant to be read against only its own rows."""
+    if last_row < first_row:
+        return
+    for col_idx in (RS_COL_THRUST, RS_COL_1MRS, RS_COL_1D, RS_COL_1M, RS_COL_OFFHIGH):
+        ws.conditional_format(first_row, col_idx, last_row, col_idx, {
+            'type': '3_color_scale',
+            'min_color': _hex(COLOR_SCALE_LOW), 'mid_color': _hex(COLOR_SCALE_MID), 'max_color': _hex(COLOR_SCALE_HIGH),
+            'min_type': 'min', 'mid_type': 'percentile', 'mid_value': 50, 'max_type': 'max',
+        })
+
+
+def _rs_setup_worksheet(ws):
+    ws.set_column(RS_COL_TICKER, RS_COL_TICKER, 8)
+    ws.set_column(RS_COL_NAME, RS_COL_NAME, 30)
+    ws.set_column(RS_COL_THRUST, RS_COL_1MRS, 13)
+    ws.set_column(RS_COL_SPARK_PRICE, RS_COL_SPARK_RS, 14)
+    ws.set_column(RS_COL_1D, RS_COL_OFFHIGH, 12)
+    ws.set_column(RS_COL_PRICE, RS_COL_PRICE, 10)
+    ws.set_column(RS_PRICE_DATA_START_COL, RS_TOTAL_COLS - 1, None, None, {'hidden': True})
+
+
+def _rs_write_block(ws, workbook, fmt_cache, df: pd.DataFrame, start_row: int) -> int:
+    """Write one self-contained mini-table -- its own header row, then
+    one data row per ticker with sparklines -- and return the row just
+    after the last data row. Writing each category as its own Excel
+    Table (its own repeated header row included) is what makes it
+    independently sortable: click that header's own filter arrow and
+    Excel sorts/filters just this block, without disturbing any other
+    category."""
+    row = start_row + 1  # start_row is reserved for the header; _rs_add_table writes it
+    first_data_row = row
+    for i, (_, series) in enumerate(df.iterrows()):
+        row_dict = series.to_dict()
+        _rs_write_row(ws, workbook, fmt_cache, row, row_dict, zebra=(i % 2 == 0))
+        _rs_add_sparklines(ws, row, row_dict)
+        row += 1
+    _rs_conditional_format(ws, first_data_row, row - 1)
+    _rs_add_table(ws, workbook, fmt_cache, start_row, row - 1)
+    return row
+
+
+def write_rs_groups_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
+    """RS_Groups: one flat, self-sortable table (all ~44 tickers ranked
+    against each other -- see run_rs_dashboard)."""
+    if df is None or df.empty:
+        return None
+    ws = workbook.add_worksheet('RS_Groups')
+    _rs_setup_worksheet(ws)
+    ws.freeze_panes(1, 2)
+    ws.set_row(0, 30)
+    _rs_write_block(ws, workbook, fmt_cache, df, start_row=0)
+    return ws
+
+
+def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
+    """RS_Indices_Sectors: one mini-table per category (Index / Segment /
+    EW Sector / SPDR Sector), each with its own repeated header row and
+    its own percentile ranking, separated by a merged category banner
+    row -- matching the source dashboard's layout instead of a single
+    flat table with a 'Category' column. Row freezing is column-only
+    (not row-only) because the header row's position shifts from block
+    to block, so freezing a fixed row wouldn't keep every block's own
+    header in view the way it does on RS_Groups."""
+    if df is None or df.empty:
+        return None
+    ws = workbook.add_worksheet('RS_Indices_Sectors')
+    _rs_setup_worksheet(ws)
+    ws.freeze_panes(0, 2)
+    category_fmt = _get_format(workbook, fmt_cache, ('rs', 'category'), {
+        'bold': True, 'bg_color': _hex(COLOR_HEADER_BG), 'font_color': _hex(COLOR_HEADER_FONT),
+        'font_size': 11, 'align': 'left', 'valign': 'vcenter', 'indent': 1,
+        'top': 2, 'top_color': _hex(COLOR_ACCENT_CYAN),
+    })
+    row = 0
+    for category in df['Category'].drop_duplicates():
+        block = df[df['Category'] == category]
+        if row > 0:
+            row += 1  # blank separator row between category blocks
+        ws.merge_range(row, 0, row, len(RS_TAB_HEADERS) - 1, str(category), category_fmt)
+        row += 1
+        row = _rs_write_block(ws, workbook, fmt_cache, block, start_row=row)
+    return ws
+
+
+def write_summary_sheet(workbook, fmt_cache: dict, sheet_counts: dict, sheet_order: list):
     """Write a first 'Summary' tab: a title, generation timestamp, and
     one row per scan tab with its match count and a clickable link
-    that jumps straight to that tab."""
-    book = writer.book
-    ws = book.create_sheet('Summary', 0)
+    that jumps straight to that tab. Must be called BEFORE any other
+    sheet is added to `workbook` -- unlike openpyxl's
+    `book.create_sheet('Summary', 0)`, xlsxwriter has no way to reorder
+    sheets after the fact, so "Summary is tab 1" only works if it's
+    written first."""
+    ws = workbook.add_worksheet('Summary')
 
-    title_font = Font(bold=True, size=16, color=COLOR_HEADER_BG)
-    subtitle_font = Font(italic=True, size=10, color="666666")
-    link_font = Font(color=COLOR_ACCENT_CYAN, underline='single', bold=True)
-    header_fill = PatternFill(start_color=COLOR_HEADER_BG, end_color=COLOR_HEADER_BG, fill_type='solid')
-    header_font = Font(bold=True, color=COLOR_HEADER_FONT)
+    title_fmt = _get_format(workbook, fmt_cache, ('summary', 'title'), {'bold': True, 'font_size': 16, 'font_color': _hex(COLOR_HEADER_BG)})
+    subtitle_fmt = _get_format(workbook, fmt_cache, ('summary', 'subtitle'), {'italic': True, 'font_size': 10, 'font_color': '#666666'})
+    header_fmt = _get_format(workbook, fmt_cache, ('summary', 'header'), {
+        'bold': True, 'bg_color': _hex(COLOR_HEADER_BG), 'font_color': _hex(COLOR_HEADER_FONT), 'align': 'center',
+    })
+    link_fmt = _get_format(workbook, fmt_cache, ('summary', 'link'), {'font_color': _hex(COLOR_ACCENT_CYAN), 'underline': True, 'bold': True, 'align': 'center'})
+    count_fmt = _get_format(workbook, fmt_cache, ('summary', 'count'), {'align': 'center'})
+    count_zebra_fmt = _get_format(workbook, fmt_cache, ('summary', 'count_zebra'), {'align': 'center', 'bg_color': _hex(COLOR_ZEBRA)})
+    name_zebra_fmt = _get_format(workbook, fmt_cache, ('summary', 'name_zebra'), {'bg_color': _hex(COLOR_ZEBRA)})
+    link_zebra_fmt = _get_format(workbook, fmt_cache, ('summary', 'link_zebra'), {
+        'font_color': _hex(COLOR_ACCENT_CYAN), 'underline': True, 'bold': True, 'align': 'center', 'bg_color': _hex(COLOR_ZEBRA),
+    })
 
-    ws['A1'] = "Trading Scans — Summary"
-    ws['A1'].font = title_font
-    ws['A2'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    ws['A2'].font = subtitle_font
-    ws['A4'] = "See the 'All_Scans' tab for every match on a single page (use the Scan filter dropdown)."
-    ws['A4'].font = subtitle_font
+    ws.write(0, 0, "Trading Scans — Summary", title_fmt)
+    ws.write(1, 0, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_fmt)
+    ws.write(3, 0, "See the 'All_Scans' tab for every match on a single page (use the Scan filter dropdown).", subtitle_fmt)
 
-    header_row = 6
-    for col_idx, label in enumerate(['Scan', 'Matches', 'Open Tab'], start=1):
-        cell = ws.cell(row=header_row, column=col_idx, value=label)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal='center')
+    header_row = 5
+    for col_idx, label in enumerate(['Scan', 'Matches', 'Open Tab']):
+        ws.write(header_row, col_idx, label, header_fmt)
 
     row = header_row + 1
     for name in sheet_order:
         if name not in sheet_counts:
             continue
-        ws.cell(row=row, column=1, value=name)
-        ws.cell(row=row, column=2, value=sheet_counts[name]).alignment = Alignment(horizontal='center')
-        link_cell = ws.cell(row=row, column=3, value="Open →")
-        link_cell.hyperlink = f"#'{name}'!A1"
-        link_cell.font = link_font
-        link_cell.alignment = Alignment(horizontal='center')
-        if row % 2 == 0:
-            for c in range(1, 4):
-                ws.cell(row=row, column=c).fill = PatternFill(start_color=COLOR_ZEBRA, end_color=COLOR_ZEBRA, fill_type='solid')
+        zebra = (row % 2 == 0)
+        ws.write(row, 0, name, name_zebra_fmt if zebra else None)
+        ws.write_number(row, 1, sheet_counts[name], count_zebra_fmt if zebra else count_fmt)
+        ws.write_url(row, 2, f"internal:'{name}'!A1", link_zebra_fmt if zebra else link_fmt, string="Open →")
         row += 1
 
-    ws.column_dimensions['A'].width = 34
-    ws.column_dimensions['B'].width = 12
-    ws.column_dimensions['C'].width = 14
+    ws.set_column(0, 0, 34)
+    ws.set_column(1, 1, 12)
+    ws.set_column(2, 2, 14)
+
+
+# Sheets whose Summary-tab "Matches" count should reflect only the rows
+# that satisfy the scan's own MATCH/NO MATCH criteria (its 'Status'
+# column) rather than every row on the tab. The tab itself is untouched --
+# this only changes what number the Summary page reports for it.
+SHEETS_COUNT_MATCHES_ONLY = {'Leveraged_Setups'}
+
+
+def _summary_count(name: str, df: pd.DataFrame) -> int:
+    if name in SHEETS_COUNT_MATCHES_ONLY and 'Status' in df.columns:
+        return int((df['Status'] == 'MATCH').sum())
+    return len(df)
 
 
 def write_styled_workbook(results_dict: dict, path: str):
@@ -890,25 +1550,37 @@ def write_styled_workbook(results_dict: dict, path: str):
     color-scale + status highlighting, the same fixed metric columns
     on every tab, a Summary tab, and 'All_Scans' as the one-page
     combined view."""
-    sheet_counts = {name: (0 if df is None or df.empty else len(df)) for name, df in results_dict.items()}
+    sheet_counts = {name: (0 if df is None or df.empty else _summary_count(name, df)) for name, df in results_dict.items()}
 
-    # Sheet order: All_Scans (one-page view) and Momentum first, then
-    # everything else in the logical scan order, then any leftovers.
-    ordered_names = [n for n in ('All_Scans', 'Momentum') if n in results_dict]
+    # Sheet order: All_Scans (one-page view) and Momentum first, then the
+    # RS Dashboard tabs (right after Summary/All_Scans/Momentum, ahead of
+    # the individual scans), then everything else in the logical scan
+    # order, then any leftovers.
+    ordered_names = [n for n in ('All_Scans', 'Momentum', 'RS_Groups', 'RS_Indices_Sectors') if n in results_dict]
     ordered_names += [n for n in SHEET_DISPLAY_ORDER if n in results_dict and n not in ordered_names]
     ordered_names += [n for n in results_dict if n not in ordered_names]
 
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+    workbook = xlsxwriter.Workbook(path)
+    fmt_cache = {}
+    try:
+        # Summary must be written FIRST -- xlsxwriter has no sheet-reorder
+        # capability, so "Summary is tab 1" only holds if nothing else is
+        # added to the workbook before it.
+        write_summary_sheet(workbook, fmt_cache, sheet_counts, ordered_names)
+
         for sheet_name in ordered_names:
             df = results_dict[sheet_name]
             if df is None or df.empty:
                 continue
-            styled_df = prepare_sheet_df(df, sheet_name)
-            styled_df.to_excel(writer, sheet_name=sheet_name, index=False)
-            ws = writer.sheets[sheet_name]
-            style_worksheet(ws, n_rows=len(styled_df) + 1, n_cols=len(styled_df.columns))
-
-        write_summary_sheet(writer, sheet_counts, ordered_names)
+            if sheet_name == 'RS_Groups':
+                write_rs_groups_sheet(workbook, fmt_cache, df)
+            elif sheet_name == 'RS_Indices_Sectors':
+                write_rs_indices_sheet(workbook, fmt_cache, df)
+            else:
+                styled_df = prepare_sheet_df(df, sheet_name)
+                write_metric_sheet(workbook, fmt_cache, sheet_name, styled_df)
+    finally:
+        workbook.close()
 
 
 if __name__ == "__main__":
@@ -922,6 +1594,7 @@ if __name__ == "__main__":
         mom_futures = {executor.submit(run_momentum, key, info): key for key, info in momentum_scans.items()}
         finviz_futures = {executor.submit(run_finviz_scan, name, filters): name for name, filters in finviz_scans.items()}
         lev_future = executor.submit(run_leveraged_etfs)
+        rs_future = executor.submit(run_rs_dashboard)
 
         for future in concurrent.futures.as_completed(ind_futures):
             name, df = future.result()
@@ -952,6 +1625,14 @@ if __name__ == "__main__":
                 all_collected_dfs.append(matched_lev_df)
             print(f"Finished {lev_name}: {len(matched_lev_df)} matches found.")
 
+        # RS Dashboard tabs stay out of all_collected_dfs/All_Scans -- they
+        # aren't "matches" from a scan and don't share the other tabs'
+        # column schema, so folding them in would just produce a mess of
+        # mismatched columns on the combined view.
+        rs_groups_df, rs_indices_df = rs_future.result()
+        results_dict['RS_Groups'] = rs_groups_df
+        results_dict['RS_Indices_Sectors'] = rs_indices_df
+
     if momentum_dfs:
         master_momentum = pd.concat(momentum_dfs, ignore_index=True)
         master_momentum.sort_values(by=['Market_Cap_Group', 'Timeframe', 'change'], ascending=[True, True, False], inplace=True)
@@ -971,7 +1652,7 @@ if __name__ == "__main__":
             "1_Fundamental_Growth", "3_Post_Earnings_Cont_Base",
             "4_Strongest_Stock_JK", "5_Strongest_Stock_10B_Rev_30_JK",
             "Daily_Tightness_Swing", "Leveraged_Setups", "Finviz_High_Short_Float",
-            "Finviz_IPO_Weekly", "Finviz_Steve_Jacobs_RS"
+            "Finviz_IPO_Weekly", "Finviz_Steve_Jacobs_RS", "Finviz_High_Velocity_Quality"
         ]
 
         if 'Source_Scan' in master_all_scans.columns and 'name' in master_all_scans.columns:
