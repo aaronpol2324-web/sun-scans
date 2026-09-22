@@ -1083,6 +1083,418 @@ def run_rs_dashboard():
 
 
 # =====================================================================
+# TREND TEMPLATE SCAN (N-Value / Bucket scoring)
+# ---------------------------------------------------------------------
+# An 11-rule stock screener plus 2 index-level "Market Direction" rules,
+# reproduced from a 12-rule set the user sourced from a third-party
+# website (see the uploaded sample CSV this was reverse-engineered
+# from) -- minus that source's "Institutional Ownership >= 5%" rule
+# (n=12 originally), which is dropped here entirely: TradingView's
+# screener silently returns null for an unrecognized field instead of
+# erroring, so a first attempt at this rule (a guessed field name that
+# almost certainly doesn't exist) came back reading as a false FAIL on
+# every single stock rather than a detectable error -- worse than not
+# having the rule at all. Every stock is scored two ways rather than
+# simple pass/fail:
+#
+#   - N-Value Rating: each rule is worth 2**n (n = the source site's
+#     own original numbering, 1-12 minus the dropped 4 -- see
+#     TT_RULE_NVALUES). A stock's N-Value Rating is the sum of 2**n
+#     over every rule it PASSES. Range: 0 (fails everything) to
+#     TT_MAX_NVALUE (passes everything) -- lower than the source
+#     site's own 8190 max since one rule's weight (2**4 = 16) is
+#     permanently missing.
+#   - Bucket Rating: for each rule, how far past (or short of) its
+#     passing threshold the stock's actual value is, as a fraction of
+#     that threshold, multiplied by the rule's own 2**n weight -- so
+#     barely passing contributes little and passing by a wide margin
+#     contributes a lot, even between two stocks that pass the exact
+#     same set of rules. Every rule uses this SAME percent-over-
+#     threshold formula (see _tt_percent_over/_tt_rule_score) --
+#     including Liquidity and Previous-Close, where the source site's
+#     own sample data didn't fit that formula (its Liquidity score was
+#     always 0 and its Previous-Close score was always a flat max
+#     value). That formula is capped per-rule at TT_MAX_PERCENT_OVER
+#     (see _tt_rule_score) -- without a cap, Liquidity's $20M floor and
+#     Previous-Close's $10 floor are both so low that a normal stock
+#     clears them by 10-50x, not the 15-20% a moving-average rule
+#     typically clears its own threshold by, so those two rules alone
+#     were dominating two-thirds or more of the total score. The one
+#     rule that keeps a fixed 0 Bucket contribution on purpose,
+#     uncapped or not, is 200d-MA-Rising: it's a pass/fail streak check
+#     with no underlying "percent over threshold" to measure at all
+#     (see below).
+#
+# Two rules need a full year of daily price history rather than a
+# single TradingView snapshot value -- Relative Strength (an EMA of a
+# daily-return ratio vs SPY) and whether the 200-day MA has been
+# rising for 21 straight sessions -- the same constraint the RS
+# Dashboard above has, and for the same reason: pulling that much
+# history for the whole market is slow. So this scan runs in two
+# stages: one TradingView query applies every OTHER rule (plus a
+# broad-but-real universe filter) first, and only the tickers that
+# query returns get a batched yfinance history pull for those two
+# history-dependent rules.
+#
+# The two "Market Direction" rules (21d MA > 50d MA, 50d MA rising for
+# 21 sessions) are evaluated against SPY by run_market_direction()
+# below, separately from the per-stock scan -- per the user's choice,
+# these are shown as an informational readout on the Summary tab and
+# do NOT gate or filter the stock screener.
+# =====================================================================
+
+# (rule key -> n-value), using the source site's own original numbering
+# (1-12) with 4 (Institutional Ownership) permanently absent -- see the
+# section header for why. 2**n is both the N-Value Rating a passing
+# rule contributes AND the Bucket Rating weight (before the
+# TT_MAX_PERCENT_OVER cap) that rule's percent-over-threshold gets
+# multiplied by.
+TT_RULE_NVALUES = {
+    'sma50_gt_sma150': 12,
+    'sma150_gt_sma200': 11,
+    'week52_span': 10,
+    'relative_strength': 9,
+    'liquidity': 8,
+    'close_above_52w_high_25pct': 7,
+    'prev_close_above_10': 6,
+    'sma200_rising_21d': 5,
+    'close_above_sma50': 3,
+    'sales_qoq_yoy': 2,
+    'eps_qoq_yoy': 1,
+}
+
+# Friendly labels for each rule's PASS/FAIL column on the tab.
+TT_RULE_LABELS = {
+    'sma50_gt_sma150': 'SMA50 > SMA150',
+    'sma150_gt_sma200': 'SMA150 > SMA200',
+    'week52_span': '52W High/Low Span',
+    'relative_strength': 'Relative Strength > 1.0',
+    'liquidity': 'Liquidity >= $20M',
+    'close_above_52w_high_25pct': 'Within 25% of 52W High',
+    'prev_close_above_10': 'Prev Close > $10',
+    'sma200_rising_21d': '200d MA Rising (21d)',
+    'close_above_sma50': 'Close > SMA50',
+    'sales_qoq_yoy': 'Sales QoQ YoY > 25%',
+    'eps_qoq_yoy': 'EPS QoQ YoY > 18%',
+}
+
+# Fixed walk order for every place that needs to iterate all 11 rules
+# (column layout, total-score calcs, etc) -- n=12 down to n=1, skipping
+# the dropped n=4.
+TT_RULE_ORDER = list(TT_RULE_NVALUES.keys())
+
+# Max possible N-Value Rating (every rule passed) -- lower than the
+# source site's own 8190 since n=4 (Institutional Ownership) is gone.
+TT_MAX_NVALUE = sum(2 ** n for n in TT_RULE_NVALUES.values())
+
+# Cap on how far past its own threshold a single rule's Bucket Rating
+# contribution can count, as a multiple of the threshold itself (2.0 =
+# 200% over) -- see the section header for why this exists. Applied
+# uniformly to every rule in _tt_rule_score, not just Liquidity/
+# Previous-Close, so there's still only one formula, just a bounded one.
+TT_MAX_PERCENT_OVER = 2.0
+
+# Universe scoping for the initial TradingView query -- broad enough to
+# rank a wide set of stocks, bounded enough that the stage-2 history
+# pull (one yfinance call per survivor) stays fast. Tune freely.
+TT_UNIVERSE_LIMIT = 500
+
+# The source site's Liquidity rule wants "SMA50_volume" -- a 50-day
+# average volume. That specific field isn't a confirmed TradingView
+# name in this project; 'average_volume_60d_calc' is (used throughout
+# the rest of this file already), so it stands in here as the closest
+# proven equivalent: SMA50 (price) x 60-day average volume, rather
+# than x 50-day.
+TT_LIQUIDITY_VOLUME_FIELD = 'average_volume_60d_calc'
+
+
+def _tt_percent_over(actual, threshold):
+    """(actual - threshold) / threshold -- the Bucket Rating's "percent
+    difference between the actual value and the passing threshold,"
+    shared by every rule below (see the section header for why this
+    one formula is used for all twelve). `actual` is always a Series;
+    `threshold` may be one too (comparing two moving averages) or a
+    plain number (e.g. the $10 Previous-Close floor). A zero threshold
+    is treated as undefined (NA) rather than raising a divide-by-zero,
+    and +-inf results (a near-zero threshold with a nonzero actual)
+    collapse to NA the same way."""
+    if isinstance(threshold, pd.Series):
+        denom = threshold.mask(threshold == 0)
+    else:
+        denom = pd.NA if threshold == 0 else threshold
+    ratio = (actual - threshold) / denom
+    if isinstance(ratio, pd.Series):
+        ratio = ratio.replace([float('inf'), float('-inf')], pd.NA)
+    return ratio
+
+
+def _tt_safe_round(series: pd.Series, ndigits: int) -> pd.Series:
+    """Round a Series to ndigits, tolerating an all-NA (object-dtype)
+    placeholder Series -- pd.NA has no __round__, so a plain .round()
+    raises on the "field wasn't available this run" columns
+    run_trend_template builds. pd.to_numeric coerces those to a proper
+    all-NaN float64 Series first, which .round() handles fine; a
+    Series that's already numeric passes through unaffected."""
+    return pd.to_numeric(series, errors='coerce').round(ndigits)
+
+
+def _tt_rule_score(passed: pd.Series, percent_over: pd.Series, n_value: int) -> pd.Series:
+    """A rule's Bucket Rating contribution: percent_over (capped at
+    TT_MAX_PERCENT_OVER -- see the section header) x 2**n_value if it
+    passed, 0 otherwise -- including wherever the metric needed for it
+    wasn't available at all, and never negative for a failing rule (a
+    stock that fails still keeps whatever it earned from the rules it
+    DOES pass)."""
+    weight = 2 ** n_value
+    passed_bool = passed.fillna(False).astype(bool)
+    capped = percent_over.fillna(0.0).clip(upper=TT_MAX_PERCENT_OVER)
+    contribution = capped * weight
+    return contribution.where(passed_bool, 0.0)
+
+
+def run_market_direction(index_ticker: str = "SPY"):
+    """The two index-level "Market Direction" rules, evaluated against
+    `index_ticker` (SPY, matching every other cross-market benchmark
+    use in this file). Returns {'index_ticker', 'ma21_gt_ma50',
+    'ma50_rising_21d'}; either bool comes back None if there wasn't
+    enough history to compute it, rather than a guessed pass/fail.
+
+    INFORMATIONAL ONLY: per the user's choice, this does not filter or
+    hide anything on the Trend_Template tab -- write_summary_sheet
+    just shows it as a readout at the top of the Summary tab."""
+    result = {'index_ticker': index_ticker, 'ma21_gt_ma50': None, 'ma50_rising_21d': None}
+    history = _fetch_rs_history([index_ticker])
+    df = history.get(index_ticker)
+    if df is None or len(df) < 71:  # 50d MA needs 50 bars, plus 21 more of the MA's own history
+        print(f"Warning: not enough {index_ticker} history to compute Market Direction rules.")
+        return result
+
+    close = df['Close']
+    sma21 = close.rolling(21).mean()
+    sma50 = close.rolling(50).mean()
+    if pd.notna(sma21.iloc[-1]) and pd.notna(sma50.iloc[-1]):
+        result['ma21_gt_ma50'] = bool(sma21.iloc[-1] > sma50.iloc[-1])
+
+    sma50_diff_tail = sma50.diff().tail(RS_ONE_MONTH_WINDOW)
+    if len(sma50_diff_tail) == RS_ONE_MONTH_WINDOW and sma50_diff_tail.notna().all():
+        result['ma50_rising_21d'] = bool((sma50_diff_tail > 0).all())
+
+    print(f"Finished Market Direction ({index_ticker}): "
+          f"21d>50d MA = {result['ma21_gt_ma50']}, 50d MA rising = {result['ma50_rising_21d']}.")
+    return result
+
+
+def run_trend_template():
+    """The 11-rule Trend Template N-Value/Bucket scoring scan (see the
+    section header above) against a broad TradingView stock universe.
+    Relative Strength and 200d-MA-Rising are computed in a second pass
+    over just the tickers the initial query returns (see the section
+    header for why)."""
+    name = "Trend_Template"
+    risky_fields = ['SMA50', 'SMA150', 'SMA200', 'price_52_week_high', TT_LIQUIDITY_VOLUME_FIELD]
+    where_conditions = [
+        col('type') == 'stock',
+        col('exchange').isin(['NASDAQ', 'NYSE', 'AMEX']),
+        col('market_cap_basic') > 300_000_000,
+        col('average_volume_60d_calc') > 200_000,
+    ]
+
+    df = None
+    try:
+        fields = STANDARD_DISPLAY_FIELDS + risky_fields
+        query = _build_query(fields, where_conditions, 'change', False, TT_UNIVERSE_LIMIT)
+        _, df = query.get_scanner_data()
+    except Exception as e:
+        print(f"Warning: {name}'s full field set failed ({e}); retrying with a minimal field "
+              f"set -- SMA150/SMA200/52-week-high will all be left blank/not evaluated this run.")
+        try:
+            fields = SAFE_FALLBACK_FIELDS + ['SMA50', TT_LIQUIDITY_VOLUME_FIELD]
+            query = _build_query(fields, where_conditions, 'change', False, TT_UNIVERSE_LIMIT)
+            _, df = query.get_scanner_data()
+        except Exception as e2:
+            print(f"Error in {name}: {e2}")
+            return name, pd.DataFrame()
+
+    if df is None or df.empty:
+        return name, pd.DataFrame()
+
+    df = df.copy()
+    has_sma150 = 'SMA150' in df.columns
+    has_sma200 = 'SMA200' in df.columns
+    has_52w_high = 'price_52_week_high' in df.columns
+
+    passed = pd.DataFrame(index=df.index)
+    scores = pd.DataFrame(index=df.index)
+
+    if has_sma150:
+        passed['sma50_gt_sma150'] = df['SMA50'] > df['SMA150']
+        scores['sma50_gt_sma150'] = _tt_rule_score(
+            passed['sma50_gt_sma150'], _tt_percent_over(df['SMA50'], df['SMA150']), TT_RULE_NVALUES['sma50_gt_sma150'])
+    else:
+        passed['sma50_gt_sma150'] = pd.NA
+        scores['sma50_gt_sma150'] = 0.0
+
+    if has_sma150 and has_sma200:
+        passed['sma150_gt_sma200'] = df['SMA150'] > df['SMA200']
+        scores['sma150_gt_sma200'] = _tt_rule_score(
+            passed['sma150_gt_sma200'], _tt_percent_over(df['SMA150'], df['SMA200']), TT_RULE_NVALUES['sma150_gt_sma200'])
+    else:
+        passed['sma150_gt_sma200'] = pd.NA
+        scores['sma150_gt_sma200'] = 0.0
+
+    if has_52w_high:
+        span_actual = 0.75 * df['price_52_week_high']
+        span_threshold = 1.25 * df['price_52_week_low']
+        passed['week52_span'] = span_actual > span_threshold
+        scores['week52_span'] = _tt_rule_score(
+            passed['week52_span'], _tt_percent_over(span_actual, span_threshold), TT_RULE_NVALUES['week52_span'])
+    else:
+        passed['week52_span'] = pd.NA
+        scores['week52_span'] = 0.0
+
+    if 'SMA50' in df.columns and TT_LIQUIDITY_VOLUME_FIELD in df.columns:
+        liquidity_value = df['SMA50'] * df[TT_LIQUIDITY_VOLUME_FIELD]
+        passed['liquidity'] = liquidity_value >= 20_000_000
+        scores['liquidity'] = _tt_rule_score(
+            passed['liquidity'], _tt_percent_over(liquidity_value, 20_000_000), TT_RULE_NVALUES['liquidity'])
+    else:
+        liquidity_value = pd.Series(pd.NA, index=df.index)
+        passed['liquidity'] = pd.NA
+        scores['liquidity'] = 0.0
+
+    if has_52w_high:
+        threshold = 0.75 * df['price_52_week_high']
+        passed['close_above_52w_high_25pct'] = df['close'] > threshold
+        scores['close_above_52w_high_25pct'] = _tt_rule_score(
+            passed['close_above_52w_high_25pct'], _tt_percent_over(df['close'], threshold), TT_RULE_NVALUES['close_above_52w_high_25pct'])
+    else:
+        passed['close_above_52w_high_25pct'] = pd.NA
+        scores['close_above_52w_high_25pct'] = 0.0
+
+    passed['prev_close_above_10'] = df['close'] > 10
+    scores['prev_close_above_10'] = _tt_rule_score(
+        passed['prev_close_above_10'], _tt_percent_over(df['close'], 10), TT_RULE_NVALUES['prev_close_above_10'])
+
+    if 'SMA50' in df.columns:
+        passed['close_above_sma50'] = df['close'] > df['SMA50']
+        scores['close_above_sma50'] = _tt_rule_score(
+            passed['close_above_sma50'], _tt_percent_over(df['close'], df['SMA50']), TT_RULE_NVALUES['close_above_sma50'])
+    else:
+        passed['close_above_sma50'] = pd.NA
+        scores['close_above_sma50'] = 0.0
+
+    if 'total_revenue_yoy_growth_fq' in df.columns:
+        passed['sales_qoq_yoy'] = df['total_revenue_yoy_growth_fq'] > 25
+        scores['sales_qoq_yoy'] = _tt_rule_score(
+            passed['sales_qoq_yoy'], _tt_percent_over(df['total_revenue_yoy_growth_fq'], 25), TT_RULE_NVALUES['sales_qoq_yoy'])
+    else:
+        passed['sales_qoq_yoy'] = pd.NA
+        scores['sales_qoq_yoy'] = 0.0
+
+    if 'earnings_per_share_diluted_yoy_growth_fq' in df.columns:
+        passed['eps_qoq_yoy'] = df['earnings_per_share_diluted_yoy_growth_fq'] > 18
+        scores['eps_qoq_yoy'] = _tt_rule_score(
+            passed['eps_qoq_yoy'], _tt_percent_over(df['earnings_per_share_diluted_yoy_growth_fq'], 18), TT_RULE_NVALUES['eps_qoq_yoy'])
+    else:
+        passed['eps_qoq_yoy'] = pd.NA
+        scores['eps_qoq_yoy'] = 0.0
+
+    # -- Stage 2: Relative Strength and 200d-MA-Rising, both of which
+    # need a year of daily history rather than a single snapshot value.
+    # Only pulled for tickers this query already returned -- SPY comes
+    # along as the RS benchmark.
+    tickers = df['name'].dropna().unique().tolist()
+    history = _fetch_rs_history(tickers + ['SPY']) if tickers else {}
+    spy_df = history.get('SPY')
+
+    rs_values, sma200_rising = [], []
+    for ticker in df['name']:
+        rec_rs, rec_slope = None, None
+        t_df = history.get(ticker)
+        if t_df is not None and spy_df is not None:
+            try:
+                close = t_df['Close']
+                ret = close.pct_change()
+                spy_close = spy_df['Close'].reindex(close.index)
+                spy_ret = spy_close.pct_change()
+                # NOTE: this is a ratio of two daily returns, exactly as
+                # the source rule defines it -- inherently noisy on any
+                # day SPY's own move is near zero (a big/undefined
+                # ratio), which _safe_ratio only guards against for an
+                # EXACT zero denominator, not a merely tiny one. That
+                # noise is a property of the rule itself, not a bug
+                # here.
+                ratio = _safe_ratio(ret, spy_ret)
+                ema60 = ratio.ewm(span=60, adjust=False, min_periods=60).mean()
+                if pd.notna(ema60.iloc[-1]):
+                    rec_rs = float(ema60.iloc[-1])
+            except Exception:
+                rec_rs = None
+        if t_df is not None:
+            try:
+                sma200 = t_df['Close'].rolling(200).mean()
+                diffs = sma200.diff().tail(RS_ONE_MONTH_WINDOW)
+                if len(diffs) == RS_ONE_MONTH_WINDOW and diffs.notna().all():
+                    rec_slope = bool((diffs > 0).all())
+            except Exception:
+                rec_slope = None
+        rs_values.append(rec_rs)
+        sma200_rising.append(rec_slope)
+
+    df['Relative_Strength_Value'] = rs_values
+    passed['relative_strength'] = df['Relative_Strength_Value'] > 1.0
+    scores['relative_strength'] = _tt_rule_score(
+        passed['relative_strength'], _tt_percent_over(df['Relative_Strength_Value'], 1.0), TT_RULE_NVALUES['relative_strength'])
+
+    df['SMA200_Rising_21d'] = pd.Series(sma200_rising, index=df.index).astype('boolean')
+    passed['sma200_rising_21d'] = df['SMA200_Rising_21d']
+    # No natural "percent over threshold" for a streak-consistency check
+    # (see the section header) -- contributes to the N-Value Rating only.
+    scores['sma200_rising_21d'] = 0.0
+
+    n_value_rating = sum(
+        passed[rule].fillna(False).astype(int) * (2 ** TT_RULE_NVALUES[rule])
+        for rule in TT_RULE_ORDER
+    )
+    bucket_rating = scores[TT_RULE_ORDER].sum(axis=1)
+    rules_passed = passed[TT_RULE_ORDER].apply(lambda c: c.fillna(False)).sum(axis=1)
+
+    # Rounded before it ever reaches the DataFrame -- not just cosmetic:
+    # unrounded floats from these calculations (e.g. SMA50 x volume, or
+    # 0.75 x price_52_week_high) often carry tiny binary-float noise
+    # (928.5500000000001, not 928.55), and _fit_column sizes a column's
+    # width off str(value) whenever its header isn't one it specially
+    # recognizes -- so that noise was making these columns dramatically
+    # wider than the 2-decimal number actually shown in each cell.
+    na_col = pd.Series(pd.NA, index=df.index)
+    out = pd.DataFrame({
+        'name': df['name'],
+        'N_Value_Rating': n_value_rating,
+        'Bucket_Rating': bucket_rating.round(2),
+        'Rules_Passed': rules_passed,
+        'close': _tt_safe_round(df['close'], 2),
+        'sector': df.get('sector'),
+        'industry': df.get('industry'),
+        'market_cap_basic': df.get('market_cap_basic'),
+        'SMA50': _tt_safe_round(df['SMA50'] if 'SMA50' in df.columns else na_col, 2),
+        'SMA150': _tt_safe_round(df['SMA150'] if has_sma150 else na_col, 2),
+        'SMA200': _tt_safe_round(df['SMA200'] if has_sma200 else na_col, 2),
+        'price_52_week_high': _tt_safe_round(df['price_52_week_high'] if has_52w_high else na_col, 2),
+        'price_52_week_low': _tt_safe_round(df['price_52_week_low'] if 'price_52_week_low' in df.columns else na_col, 2),
+        'Relative_Strength_Value': _tt_safe_round(df['Relative_Strength_Value'], 3),
+        'Liquidity_Value': _tt_safe_round(liquidity_value, 2),
+        'Sales_QoQ_YoY': _tt_safe_round(df['total_revenue_yoy_growth_fq'] if 'total_revenue_yoy_growth_fq' in df.columns else na_col, 2),
+        'EPS_QoQ_YoY': _tt_safe_round(df['earnings_per_share_diluted_yoy_growth_fq'] if 'earnings_per_share_diluted_yoy_growth_fq' in df.columns else na_col, 2),
+    })
+    for rule in TT_RULE_ORDER:
+        out[f'Pass_{rule}'] = passed[rule]
+
+    out = out.sort_values(by='Bucket_Rating', ascending=False, na_position='last', kind='stable').reset_index(drop=True)
+    print(f"Finished {name}: {len(out)} tickers scored.")
+    return name, out
+
+
+# =====================================================================
 # EXCEL OUTPUT STYLING
 # ---------------------------------------------------------------------
 # Everything below controls ONLY how results_dict gets written to the
@@ -1749,14 +2161,119 @@ def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame, sheet_na
     return ws
 
 
-def write_summary_sheet(workbook, fmt_cache: dict, sheet_counts: dict, sheet_order: list):
-    """Write a first 'Summary' tab: a title, generation timestamp, and
-    one row per scan tab with its match count and a clickable link
-    that jumps straight to that tab. Must be called BEFORE any other
-    sheet is added to `workbook` -- unlike openpyxl's
-    `book.create_sheet('Summary', 0)`, xlsxwriter has no way to reorder
-    sheets after the fact, so "Summary is tab 1" only works if it's
-    written first."""
+def write_trend_template_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
+    """Trend_Template: the 11-rule N-Value/Bucket-score screener (see
+    the TREND TEMPLATE SCAN section header for the full rules and
+    scoring, and run_trend_template for how the DataFrame is built).
+    Bespoke writer (not write_metric_sheet) because this tab's columns --
+    two composite scores, a passed-rule count, eleven PASS/FAIL
+    columns, then the raw supporting values -- don't match the fixed
+    schema every other scan tab shares; same reasoning as
+    RS_Groups/RS_Indices_Sectors having their own writers.
+
+    Default row order: sorted by Bucket Rating descending (see
+    run_trend_template) -- the sortable header (autofilter) lets it be
+    re-sorted by hand at any time, same as every other tab."""
+    if df is None or df.empty:
+        return None
+
+    display = pd.DataFrame({
+        'Ticker': df['name'],
+        'N-Value Score': df['N_Value_Rating'],
+        'Bucket Score': df['Bucket_Rating'],
+        'Rules Passed': df['Rules_Passed'],
+        'Price': df['close'],
+        'Sector': df['sector'],
+        'Industry': df['industry'],
+        'Market Cap': df['market_cap_basic'],
+    })
+    for r in TT_RULE_ORDER:
+        display[TT_RULE_LABELS[r]] = df[f'Pass_{r}'].map(lambda v: 'N/A' if pd.isna(v) else ('PASS' if v else 'FAIL'))
+    display['SMA50'] = df['SMA50']
+    display['SMA150'] = df['SMA150']
+    display['SMA200'] = df['SMA200']
+    display['52W High'] = df['price_52_week_high']
+    display['52W Low'] = df['price_52_week_low']
+    display['Relative Strength (EMA60)'] = df['Relative_Strength_Value']
+    display['Liquidity ($)'] = df['Liquidity_Value']
+    display['Sales QoQ YoY %'] = df['Sales_QoQ_YoY']
+    display['EPS QoQ YoY %'] = df['EPS_QoQ_YoY']
+
+    n_rows, n_cols = len(display), len(display.columns)
+    if n_rows == 0 or n_cols == 0:
+        return None
+    ws = workbook.add_worksheet('Trend_Template')
+    headers = list(display.columns)
+    header_fmt = _header_format(workbook, fmt_cache)
+    for c, header in enumerate(headers):
+        ws.write(0, c, header, header_fmt)
+
+    pass_fail_headers = {TT_RULE_LABELS[r] for r in TT_RULE_ORDER}
+    percent_headers = {'Sales QoQ YoY %', 'EPS QoQ YoY %'}
+    price_headers = {'Price', 'SMA50', 'SMA150', 'SMA200', '52W High', '52W Low'}
+    currency_headers = {'Market Cap', 'Liquidity ($)'}
+    ratio_headers = {'Relative Strength (EMA60)'}
+    integer_headers = {'Rules Passed', 'N-Value Score'}
+
+    def numfmt_for(header):
+        if header in pass_fail_headers or header in ('Ticker', 'Sector', 'Industry'):
+            return None
+        if header == 'Bucket Score':
+            return '#,##0.00'
+        if header in integer_headers:
+            return '#,##0'
+        if header in percent_headers:
+            return '0.00"%"'
+        if header in currency_headers:
+            return ABBREVIATED_CURRENCY_FORMAT
+        if header in price_headers or header in ratio_headers:
+            return '0.00'
+        return None
+
+    max_header_lines = 1
+    for c, header in enumerate(headers):
+        numfmt = numfmt_for(header)
+        plain_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=False)
+        zebra_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=True)
+        col_values = display.iloc[:, c].tolist()
+        for r, value in enumerate(col_values):
+            fmt = zebra_fmt if r % 2 == 0 else plain_fmt
+            _write_cell(ws, r + 1, c, value, fmt)
+        lines_needed = _fit_column(ws, workbook, fmt_cache, c, header, col_values, n_rows, apply_conditional=False)
+        max_header_lines = max(max_header_lines, lines_needed)
+
+        if header in pass_fail_headers:
+            match_fmt = _get_format(workbook, fmt_cache, ('status', 'match'), {'bg_color': _hex(COLOR_MATCH_FILL)})
+            nomatch_fmt = _get_format(workbook, fmt_cache, ('status', 'nomatch'), {'bg_color': _hex(COLOR_NOMATCH_FILL)})
+            ws.conditional_format(1, c, n_rows, c, {'type': 'cell', 'criteria': 'equal to', 'value': '"PASS"', 'format': match_fmt})
+            ws.conditional_format(1, c, n_rows, c, {'type': 'cell', 'criteria': 'equal to', 'value': '"FAIL"', 'format': nomatch_fmt})
+        elif header in ('N-Value Score', 'Bucket Score'):
+            ws.conditional_format(1, c, n_rows, c, {
+                'type': '3_color_scale',
+                'min_color': _hex(COLOR_SCALE_LOW), 'mid_color': _hex(COLOR_SCALE_MID), 'max_color': _hex(COLOR_SCALE_HIGH),
+                'min_type': 'min', 'mid_type': 'percentile', 'mid_value': 50, 'max_type': 'max',
+            })
+
+    ws.set_row(0, 15 * max_header_lines + 8)
+    ws.freeze_panes(1, 1)
+    ws.autofilter(0, 0, n_rows, n_cols - 1)
+    return ws
+
+
+def write_summary_sheet(workbook, fmt_cache: dict, sheet_counts: dict, sheet_order: list, market_direction: dict = None):
+    """Write a first 'Summary' tab: a title, generation timestamp,
+    optionally the Market Direction readout (see below), and one row
+    per scan tab with its match count and a clickable link that jumps
+    straight to that tab. Must be called BEFORE any other sheet is
+    added to `workbook` -- unlike openpyxl's `book.create_sheet(
+    'Summary', 0)`, xlsxwriter has no way to reorder sheets after the
+    fact, so "Summary is tab 1" only works if it's written first.
+
+    market_direction (optional): the dict run_market_direction()
+    returns -- {'index_ticker', 'ma21_gt_ma50', 'ma50_rising_21d'}.
+    When given, two PASS/FAIL/N-A status lines are shown here,
+    purely informational (see the TREND TEMPLATE SCAN section header
+    for why this doesn't filter the Trend_Template tab itself)."""
     ws = workbook.add_worksheet('Summary')
 
     title_fmt = _get_format(workbook, fmt_cache, ('summary', 'title'), {'bold': True, 'font_size': 16, 'font_color': _hex(COLOR_HEADER_BG)})
@@ -1771,12 +2288,35 @@ def write_summary_sheet(workbook, fmt_cache: dict, sheet_counts: dict, sheet_ord
     link_zebra_fmt = _get_format(workbook, fmt_cache, ('summary', 'link_zebra'), {
         'font_color': _hex(COLOR_ACCENT_CYAN), 'underline': True, 'bold': True, 'align': 'center', 'bg_color': _hex(COLOR_ZEBRA),
     })
+    md_label_fmt = _get_format(workbook, fmt_cache, ('summary', 'md_label'), {'bold': True})
+    md_pass_fmt = _get_format(workbook, fmt_cache, ('summary', 'md_pass'), {'bold': True, 'bg_color': _hex(COLOR_MATCH_FILL)})
+    md_fail_fmt = _get_format(workbook, fmt_cache, ('summary', 'md_fail'), {'bold': True, 'bg_color': _hex(COLOR_NOMATCH_FILL)})
 
     ws.write(0, 0, "Trading Scans — Summary", title_fmt)
     ws.write(1, 0, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_fmt)
-    ws.write(3, 0, "See the 'All_Scans' tab for every match on a single page (use the Scan filter dropdown).", subtitle_fmt)
 
-    header_row = 5
+    next_row = 3
+    if market_direction:
+        idx = market_direction.get('index_ticker', 'SPY')
+
+        def md_status(value):
+            if value is None:
+                return "N/A", md_label_fmt
+            return ("PASS", md_pass_fmt) if value else ("FAIL", md_fail_fmt)
+
+        ws.write(next_row, 0, f"Market Direction ({idx}): 21d MA > 50d MA", md_label_fmt)
+        text, fmt = md_status(market_direction.get('ma21_gt_ma50'))
+        ws.write(next_row, 1, text, fmt)
+        next_row += 1
+        ws.write(next_row, 0, f"Market Direction ({idx}): 50d MA Rising (21 sessions)", md_label_fmt)
+        text, fmt = md_status(market_direction.get('ma50_rising_21d'))
+        ws.write(next_row, 1, text, fmt)
+        next_row += 2
+
+    ws.write(next_row, 0, "See the 'All_Scans' tab for every match on a single page (use the Scan filter dropdown).", subtitle_fmt)
+    next_row += 2
+
+    header_row = next_row
     for col_idx, label in enumerate(['Scan', 'Matches', 'Open Tab']):
         ws.write(header_row, col_idx, label, header_fmt)
 
@@ -1808,19 +2348,24 @@ def _summary_count(name: str, df: pd.DataFrame) -> int:
     return len(df)
 
 
-def write_styled_workbook(results_dict: dict, path: str):
+def write_styled_workbook(results_dict: dict, path: str, market_direction: dict = None):
     """Write results_dict to an .xlsx file with all the formatting
     above applied: styled headers, freeze/filter, number formats,
     color-scale + status highlighting, the same fixed metric columns
     on every tab, a Summary tab, and 'All_Scans' as the one-page
-    combined view."""
+    combined view.
+
+    market_direction (optional): passed straight through to
+    write_summary_sheet -- see run_market_direction/that function's
+    docstring."""
     sheet_counts = {name: (0 if df is None or df.empty else _summary_count(name, df)) for name, df in results_dict.items()}
 
     # Sheet order: All_Scans (one-page view) and Momentum first, then the
-    # RS Dashboard tabs (right after Summary/All_Scans/Momentum, ahead of
-    # the individual scans), then everything else in the logical scan
-    # order, then any leftovers.
-    ordered_names = [n for n in ('All_Scans', 'Momentum', 'RS_Groups', 'RS_Indices_Sectors') if n in results_dict]
+    # RS Dashboard tabs and Trend_Template (right after Summary/All_Scans/
+    # Momentum, ahead of the individual scans -- all three are dashboard-
+    # style tabs with their own bespoke schema/writer, not "scan matches"),
+    # then everything else in the logical scan order, then any leftovers.
+    ordered_names = [n for n in ('All_Scans', 'Momentum', 'RS_Groups', 'RS_Indices_Sectors', 'Trend_Template') if n in results_dict]
     ordered_names += [n for n in SHEET_DISPLAY_ORDER if n in results_dict and n not in ordered_names]
     ordered_names += [n for n in results_dict if n not in ordered_names]
 
@@ -1830,7 +2375,7 @@ def write_styled_workbook(results_dict: dict, path: str):
         # Summary must be written FIRST -- xlsxwriter has no sheet-reorder
         # capability, so "Summary is tab 1" only holds if nothing else is
         # added to the workbook before it.
-        write_summary_sheet(workbook, fmt_cache, sheet_counts, ordered_names)
+        write_summary_sheet(workbook, fmt_cache, sheet_counts, ordered_names, market_direction=market_direction)
 
         for sheet_name in ordered_names:
             df = results_dict[sheet_name]
@@ -1840,6 +2385,8 @@ def write_styled_workbook(results_dict: dict, path: str):
                 write_rs_groups_sheet(workbook, fmt_cache, df)
             elif sheet_name == 'RS_Indices_Sectors':
                 write_rs_indices_sheet(workbook, fmt_cache, df)
+            elif sheet_name == 'Trend_Template':
+                write_trend_template_sheet(workbook, fmt_cache, df)
             else:
                 styled_df = prepare_sheet_df(df, sheet_name)
                 write_metric_sheet(workbook, fmt_cache, sheet_name, styled_df)
@@ -1859,6 +2406,8 @@ if __name__ == "__main__":
         finviz_futures = {executor.submit(run_finviz_scan, name, filters): name for name, filters in finviz_scans.items()}
         lev_future = executor.submit(run_leveraged_etfs)
         rs_future = executor.submit(run_rs_dashboard)
+        tt_future = executor.submit(run_trend_template)
+        md_future = executor.submit(run_market_direction)
 
         for future in concurrent.futures.as_completed(ind_futures):
             name, df = future.result()
@@ -1896,6 +2445,14 @@ if __name__ == "__main__":
         rs_groups_df, rs_indices_df = rs_future.result()
         results_dict['RS_Groups'] = rs_groups_df
         results_dict['RS_Indices_Sectors'] = rs_indices_df
+
+        # Trend_Template likewise stays out of all_collected_dfs/All_Scans --
+        # its own bespoke N-Value/Bucket-score schema doesn't match the
+        # other tabs' columns either. Market Direction isn't a tab at all,
+        # just two status lines write_summary_sheet shows on the Summary tab.
+        tt_name, tt_df = tt_future.result()
+        results_dict[tt_name] = tt_df
+        market_direction = md_future.result()
 
     if momentum_dfs:
         master_momentum = pd.concat(momentum_dfs, ignore_index=True)
@@ -1940,9 +2497,9 @@ if __name__ == "__main__":
 
     excel_path = r"C:\TradingScans\My_Scans.xlsx"
     try:
-        write_styled_workbook(results_dict, excel_path)
+        write_styled_workbook(results_dict, excel_path, market_direction)
         print(f"Done! Saved cleanly to: {excel_path}")
     except PermissionError:
         alt_path = r"C:\TradingScans\My_Scans_NEW.xlsx"
-        write_styled_workbook(results_dict, alt_path)
+        write_styled_workbook(results_dict, alt_path, market_direction)
         print(f"\n[WARNING] Excel file was locked. Saved master file to: {alt_path}")
