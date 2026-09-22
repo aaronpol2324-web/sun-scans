@@ -7,6 +7,8 @@ import yfinance as yf
 from finvizfinance.screener.custom import Custom
 from finvizfinance.constants import filter_dict as _finviz_filter_dict
 import logging
+import threading
+import time
 from datetime import datetime
 
 import xlsxwriter
@@ -337,6 +339,50 @@ finviz_scans = {
     },
 }
 
+# =====================================================================
+# SAFE YAHOO DOWNLOADS
+# ---------------------------------------------------------------------
+# Three scans (Leveraged_Setups, the RS dashboard, Trend_Template) all
+# call yf.download, and the main block runs them in parallel threads.
+# Many yfinance versions keep download bookkeeping in module-level
+# globals, so two downloads overlapping can wipe each other's state and
+# leave one waiting forever -- the whole script then never finishes.
+# _yf_download serializes every Yahoo download behind one lock, and
+# gives each call a hard time limit: a call that hangs past
+# YF_CALL_TIMEOUT is abandoned (it runs in a daemon thread, so it can't
+# keep the script alive) and treated as "no data" for those tickers.
+# =====================================================================
+_YF_LOCK = threading.Lock()
+YF_CALL_TIMEOUT = 180  # seconds per download call
+
+
+def _yf_download(tickers, **kwargs):
+    label = f"{len(tickers)} tickers" if isinstance(tickers, (list, tuple)) else str(tickers)
+    if not _YF_LOCK.acquire(timeout=YF_CALL_TIMEOUT * 4):
+        print(f"Warning: gave up waiting for a Yahoo download slot ({label}); skipping.")
+        return pd.DataFrame()
+    box = {}
+
+    def work():
+        try:
+            box['df'] = yf.download(tickers, **kwargs)
+        except Exception as e:
+            box['err'] = e
+
+    try:
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(YF_CALL_TIMEOUT)
+        if th.is_alive():
+            print(f"Warning: Yahoo download of {label} didn't finish in {YF_CALL_TIMEOUT}s; skipping it.")
+            return pd.DataFrame()
+    finally:
+        _YF_LOCK.release()
+    if 'err' in box:
+        raise box['err']
+    return box.get('df', pd.DataFrame())
+
+
 leveraged_tickers = [
     "TQQQ", "SOXL", "QLD", "SSO", "FNGU", "SPXL", "TECL", "UPRO", "TSLL", "NVDL",
     "MUU", "BULZ", "USD", "TMF", "FAS", "SNXX", "AGQ", "ROM", "GDXU", "TNA",
@@ -382,7 +428,7 @@ def run_leveraged_etfs():
     try:
         # ~1 year of history in a single batched request, so 1Y performance
         # and a true 52-week low can be computed for every ticker at once.
-        data = yf.download(leveraged_tickers, period="1y", progress=False, group_by='ticker')
+        data = _yf_download(leveraged_tickers, period="1y", progress=False, group_by='ticker')
 
         for t in leveraged_tickers:
             try:
@@ -732,6 +778,17 @@ def run_finviz_scan(name, filters_dict):
 RS_THRUST_WINDOW = 5      # "the past week"
 RS_ONE_MONTH_WINDOW = 21
 
+# "Liquid enough to trade directly" threshold for RS_Groups' Ticker-cell
+# highlight (see _rs_avg_dollar_volume / write_rs_groups_sheet): a
+# ticker is highlighted if its OWN trailing-month average dollar volume
+# clears this bar, OR it has a high-confidence leveraged ETF proxy (see
+# LEVERAGED_ETF_PROXIES below) whose OWN average dollar volume also
+# clears this same bar -- a proxy that exists but barely trades isn't
+# actually usable, so it has to be liquid too, not just "a real fund."
+# This mirrors, but doesn't try to exactly reverse-engineer, the yellow
+# highlighting on Jeff Sun's own version of this table.
+RS_LIQUID_DOLLAR_VOLUME = 100_000_000
+
 # Just the watchlist of (ticker, name) pairs -- the row order actually
 # written to the sheet is a default sort by 1-Mth RRS (see
 # write_rs_groups_sheet), so the order here doesn't matter.
@@ -748,53 +805,120 @@ RS_ONE_MONTH_WINDOW = 21
 # GUNR) that were confirmed at some earlier point but are NOT in this
 # latest complete table, so they're dropped rather than held onto on
 # the assumption they're still current.
+# Updated to match the ticker list/order from Jeff Sun's (@jfsrev)
+# "strongest industry groups by 1-week weighted RS ... sorted against
+# their 1-month RS%" table, which this whole RS_Groups tab is modeled
+# on. His screenshot was cut off after SOCL, so this is his confirmed
+# 47-ticker list; anything past that point wasn't legible enough to
+# transcribe reliably and was left out rather than guessed.
 RS_GROUPS = [
-    ("BUG", "Pure Cybersecurity Software"),
-    ("CIBR", "Cybersecurity Software & Infra"),
-    ("BOAT", "Global Shipping"),
     ("MAGS", "Magnificent 7"),
-    ("WOOD", "Timber & Lumber"),
-    ("TLT", "20+ Year Treasury Bonds"),
     ("ARKG", "ARK Genomics"),
-    ("FDN", "US Internet Giants"),
-    ("UNG", "Natural Gas"),
-    ("ESPO", "E-Sports"),
     ("AIQ", "AI Software & Data Processing"),
-    ("HYDR", "Hydrogen Energy & Fuel Cells"),
-    ("IDGT", "Digital Infrastructure & Data Centers"),
-    ("XTL", "Telecom"),
-    ("ARKX", "ARK Space Exploration"),
-    ("SVIX", "Short VIX Futures (Volatility)"),
-    ("ASHR", "China A-Share"),
     ("BUZZ", "Social Media"),
-    ("NASA", "Space Economy"),
     ("ARKK", "ARK Innovation"),
-    ("SPMO", "S&P 500 Momentum"),
-    ("XSD", "Semiconductors (Equal)"),
-    ("DRAM", "Memory"),
-    ("ETHA", "Ether Spot"),
-    ("AMLP", "Energy MLPs"),
     ("BOTZ", "AI & Robotics"),
     ("ARKQ", "ARK Robotics"),
     ("ARKW", "ARK Internet & Next-Gen Tech"),
+    ("XSD", "Semiconductors (Equal)"),
     ("QTUM", "Quantum/AI"),
     ("BAI", "AI & Tech Active"),
     ("MEME", "Meme"),
     ("SOXX", "Broad Semiconductor"),
+    ("ETHA", "Ether Spot"),
     ("WGMI", "Internet Services & Infrastructure"),
+    ("SPMO", "S&P 500 Momentum"),
     ("SMH", "Semiconductors Giants"),
+    ("ASHR", "China A-Share"),
     ("SOLZ", "Solana Spot"),
     ("IBIT", "Bitcoin Spot"),
     ("BLOK", "Blockchain"),
     ("ROBO", "Robotics & Automation"),
-    ("PPLT", "Platinum"),
     ("GXC", "China ETF"),
+    ("TLT", "20+ Year Treasury Bonds"),
+    ("SVIX", "Short VIX Futures (Volatility)"),
+    ("NASA", "Space Economy"),
+    ("ARKX", "ARK Space Exploration"),
     ("GRID", "Infrastructure & Electrical Equipment"),
+    ("DRAM", "Memory"),
     ("KURE", "China Health"),
+    ("XTL", "Telecom"),
     ("ARKF", "ARK Fintech"),
-    ("SLV", "Silver"),
-    ("PBE", "Dynamic Biotech"),
+    ("IDGT", "Digital Infrastructure & Data Centers"),
+    ("BUG", "Pure Cybersecurity Software"),
+    ("CIBR", "Cybersecurity Software & Infra"),
+    ("FDN", "US Internet Giants"),
+    ("ESPO", "E-Sports"),
+    ("JETS", "Airlines"),
+    ("UFO", "Space Industry"),
+    ("EUV", "Photonics"),
+    ("XRPI", "XRP Spot"),
+    ("CLOU", "Cloud Infrastructure & SaaS"),
+    ("FXI", "China Large-Caps"),
+    ("EWY", "South Korea Equities"),
+    ("DRIV", "EV & Autonomous Vehicles"),
+    ("IGV", "US Tech/Software"),
+    ("SOCL", "Social Media"),
 ]
+
+# ---------------------------------------------------------------------
+# Leveraged/inverse ETF proxies for the RS_GROUPS tickers above --
+# researched via web search against issuer product pages (Direxion,
+# Roundhill, ProShares, Volatility Shares, Elevate Shares) and ETF
+# data sites (ETFdb/VettaFi, StockAnalysis.com), not guessed. Verified
+# September 2026; this corner of the ETF market moves fast (several of
+# these launched in 2025-2026, and a few older ones -- e.g. Direxion's
+# EVAV for DRIV -- have already been delisted), so it's worth spot-
+# checking a ticker directly with the issuer before trading it if this
+# list is more than a few months old.
+#
+# Two different kinds of "proxy" are mixed in here on purpose, since
+# both satisfy "a leveraged version I could trade instead": most track
+# the SAME underlying INDEX the base ETF does (e.g. SOXL/SOXX both
+# track the ICE Semiconductor Index) -- but a few (TARK/ARKK, BTCU/
+# IBIT, EVMU/ETHA, BLOC/BLOK, RAM/DRAM, YEET/MEME) instead target a
+# fixed multiple of the base fund's OWN daily return directly, which
+# works just as well as a tradeable proxy but is a structurally
+# different kind of fund. `note` flags which is which, plus any known
+# index/structure mismatch worth knowing about before treating it as a
+# 1:1 substitute.
+#
+# Only rules_confidence == "high" ETF proxies count toward the
+# "liquid enough" highlighting on RS_Groups (see RS_LIQUID_DOLLAR_VOLUME
+# below) -- "medium" ones are real, tradeable funds but track a
+# noticeably different index than their listed base ticker, so they're
+# still shown on the Leveraged_Proxies tab but don't by themselves turn
+# a row yellow.
+LEVERAGED_ETF_PROXIES = {
+    "MAGS": [{"ticker": "MAGX", "fund": "Roundhill Daily 2X Long Magnificent Seven ETF", "leverage": "2x bull", "confidence": "high", "note": "Same issuer as MAGS, same 7-stock basket."},
+             {"ticker": "MAGQ", "fund": "Roundhill Daily Inverse Magnificent Seven ETF", "leverage": "-1x inverse", "confidence": "high", "note": "Same issuer/basket as MAGS, inverse."}],
+    "AIQ": [{"ticker": "AIBU", "fund": "Direxion Daily AI and Big Data Bull 2X Shares", "leverage": "2x bull", "confidence": "medium", "note": "Tracks the Solactive US AI & Big Data Index, not AIQ's Indxx index -- same theme, different index."},
+            {"ticker": "AIBD", "fund": "Direxion Daily AI and Big Data Bear 2X Shares", "leverage": "-2x bear", "confidence": "medium", "note": "Same index mismatch as AIBU."}],
+    "ARKK": [{"ticker": "TARK", "fund": "Tradr 2X Long Innovation Daily ETF", "leverage": "2x bull", "confidence": "high", "note": "Targets 2x of ARKK's own daily NAV directly."},
+             {"ticker": "SARK", "fund": "Tradr 1X Short Innovation Daily ETF", "leverage": "-1x inverse", "confidence": "high", "note": "Targets -1x of ARKK's own daily NAV directly."}],
+    "BOTZ": [{"ticker": "UBOT", "fund": "Direxion Daily Robotics, Artificial Intelligence & Automation Index Bull 2X", "leverage": "2x bull", "confidence": "high", "note": "Same Indxx Global Robotics & AI index as BOTZ."}],
+    "MEME": [{"ticker": "YEET", "fund": "Roundhill Daily 2X Long Meme Stock ETF", "leverage": "2x bull", "confidence": "high", "note": "Same issuer as MEME, its designated 2x companion."}],
+    "SOXX": [{"ticker": "SOXL", "fund": "Direxion Daily Semiconductor Bull 3X Shares", "leverage": "3x bull", "confidence": "high", "note": "Same ICE Semiconductor Index as SOXX."},
+             {"ticker": "SOXS", "fund": "Direxion Daily Semiconductor Bear 3X Shares", "leverage": "-3x bear", "confidence": "high", "note": "Same ICE Semiconductor Index as SOXX."}],
+    "ETHA": [{"ticker": "EVMU", "fund": "Direxion Daily Ether Bull 2X ETF", "leverage": "2x bull", "confidence": "high", "note": "Direxion states this tracks ETHA's own performance at 2x directly."}],
+    "ASHR": [{"ticker": "CHAU", "fund": "Direxion Daily CSI 300 China A Share Bull 2X", "leverage": "2x bull", "confidence": "high", "note": "Same CSI 300 Index as ASHR."}],
+    "SOLZ": [{"ticker": "SOLT", "fund": "Volatility Shares 2x Solana ETF", "leverage": "2x bull", "confidence": "high", "note": "Same issuer as SOLZ, its designated 2x companion."}],
+    "IBIT": [{"ticker": "BTCU", "fund": "Direxion Daily Bitcoin Bull 2X ETF", "leverage": "2x bull", "confidence": "high", "note": "Direxion states this tracks IBIT's own performance at 2x directly."}],
+    "BLOK": [{"ticker": "BLOC", "fund": "Elevate Shares 2X Daily BLOK ETF", "leverage": "2x bull", "confidence": "high", "note": "Targets 2x of BLOK's own daily NAV directly."}],
+    "TLT": [{"ticker": "TMF", "fund": "Direxion Daily 20+ Year Treasury Bull 3X Shares", "leverage": "3x bull", "confidence": "high", "note": "Same ICE 20+ Year Treasury Bond Index as TLT."},
+            {"ticker": "TMV", "fund": "Direxion Daily 20+ Year Treasury Bear 3X Shares", "leverage": "-3x bear", "confidence": "high", "note": "Same ICE 20+ Year Treasury Bond Index as TLT."}],
+    "SVIX": [{"ticker": "UVIX", "fund": "Volatility Shares 2x Long VIX Futures ETF", "leverage": "2x long (opposite direction)", "confidence": "high", "note": "Same issuer/futures family as SVIX, but long volatility -- opposite direction, not a leveraged version of SVIX itself."}],
+    "DRAM": [{"ticker": "RAM", "fund": "Roundhill/T-Rex 2X Long DRAM Daily Target ETF", "leverage": "2x bull", "confidence": "high", "note": "Launched by DRAM's own issuer as its 2x daily-target companion."}],
+    "FDN": [{"ticker": "WEBL", "fund": "Direxion Daily Dow Jones Internet Bull 3X Shares", "leverage": "3x bull", "confidence": "high", "note": "Same Dow Jones Internet Composite Index as FDN. (This is 3x, not the 2x sometimes assumed.)"},
+            {"ticker": "WEBS", "fund": "Direxion Daily Dow Jones Internet Bear 3X Shares", "leverage": "-3x bear", "confidence": "high", "note": "Same Dow Jones Internet Composite Index as FDN."}],
+    "JETS": [{"ticker": "JETU", "fund": "MAX Airlines 3X Leveraged ETN", "leverage": "3x bull", "confidence": "medium", "note": "An ETN (issuer credit risk), and tracks the Prime Airlines Index, not JETS' own U.S. Global Jets Index -- closely related but different benchmark."},
+             {"ticker": "JETD", "fund": "MAX Airlines -3X Inverse Leveraged ETN", "leverage": "-3x inverse", "confidence": "medium", "note": "Same ETN/index caveats as JETU."}],
+    "XRPI": [{"ticker": "XRPT", "fund": "Volatility Shares 2x XRP ETF", "leverage": "2x bull", "confidence": "high", "note": "Same issuer as XRPI, its designated 2x companion."}],
+    "CLOU": [{"ticker": "CLDL", "fund": "Direxion Daily Cloud Computing Bull 2X Shares", "leverage": "2x bull", "confidence": "medium", "note": "Sources show slightly different Indxx index variants (US vs. Global Cloud Computing) between CLDL and CLOU -- worth double-checking against Direxion's current fact sheet."}],
+    "FXI": [{"ticker": "YINN", "fund": "Direxion Daily FTSE China Bull 3X Shares", "leverage": "3x bull", "confidence": "high", "note": "Same FTSE China 50 Index as FXI."},
+            {"ticker": "YANG", "fund": "Direxion Daily FTSE China Bear 3X Shares", "leverage": "-3x bear", "confidence": "high", "note": "Same FTSE China 50 Index as FXI."}],
+    "EWY": [{"ticker": "KORU", "fund": "Direxion Daily South Korea Bull 3X Shares", "leverage": "3x bull", "confidence": "high", "note": "Same MSCI Korea index family as EWY."}],
+}
 
 # (category, ticker, name) -- category becomes its own filterable
 # column (via the auto-filter every tab already gets) rather than a
@@ -857,7 +981,7 @@ def _fetch_rs_history(tickers):
     logger.setLevel(logging.CRITICAL)
     history = {}
     try:
-        data = yf.download(tickers, period="1y", progress=False, group_by='ticker')
+        data = _yf_download(tickers, period="1y", progress=False, group_by='ticker')
         for t in tickers:
             try:
                 df = data if len(tickers) == 1 else (data[t] if t in data.columns.levels[0] else pd.DataFrame())
@@ -871,6 +995,85 @@ def _fetch_rs_history(tickers):
     finally:
         logger.setLevel(original_level)
     return history
+
+
+def _to_yahoo_symbol(tv_symbol: str) -> str:
+    """TradingView writes share classes with a dot (BRK.B, BF.B); Yahoo
+    uses a dash (BRK-B, BF-B). Without this, every class-share stock
+    comes back with no history and reads N/A on the history rules."""
+    return str(tv_symbol).replace('.', '-').replace('/', '-')
+
+
+def _fetch_tt_history(tickers):
+    """Trend_Template's stage-2 history pull. Same idea as
+    _fetch_rs_history, but built for a universe of a few thousand
+    stocks: TT_HISTORY_PERIOD of bars (enough for a 200-day SMA plus a
+    21-day rising streak), downloaded in TT_HISTORY_CHUNK-sized batches
+    so a throttled batch only loses those tickers, with one retry pass
+    for anything that came back empty. Returns {tradingview_ticker:
+    DataFrame} keyed by the ORIGINAL TradingView symbol."""
+    logger = yf.utils.get_yf_logger()
+    original_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    history = {}
+
+    def pull(batch):
+        yahoo_map = {_to_yahoo_symbol(t): t for t in batch}
+        ysyms = list(yahoo_map.keys())
+        try:
+            data = _yf_download(ysyms, period=TT_HISTORY_PERIOD, progress=False,
+                               group_by='ticker', auto_adjust=True, threads=True)
+        except Exception:
+            return
+        if data is None or data.empty:
+            return
+        for ysym, tv in yahoo_map.items():
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if ysym not in data.columns.get_level_values(0):
+                        continue
+                    t_df = data[ysym]
+                else:
+                    t_df = data
+                t_df = t_df.dropna(subset=['Close'])
+                if len(t_df) >= RS_ONE_MONTH_WINDOW + 1:
+                    history[tv] = t_df
+            except Exception:
+                continue
+
+    try:
+        unique = list(dict.fromkeys(tickers))
+        n_chunks = -(-len(unique) // TT_HISTORY_CHUNK)
+        started = time.time()
+        for k, i in enumerate(range(0, len(unique), TT_HISTORY_CHUNK), start=1):
+            pull(unique[i:i + TT_HISTORY_CHUNK])
+            print(f"Trend_Template history: batch {k}/{n_chunks} done "
+                  f"({len(history)} tickers so far, {time.time() - started:.0f}s elapsed)")
+        missing = [t for t in unique if t not in history]
+        if missing:
+            for i in range(0, len(missing), TT_HISTORY_CHUNK):
+                pull(missing[i:i + TT_HISTORY_CHUNK])
+        still_missing = [t for t in unique if t not in history]
+        print(f"Trend_Template history: got {len(history)} of {len(unique)} tickers from Yahoo"
+              + (f"; missing {len(still_missing)} (first few: {still_missing[:10]})" if still_missing else "."))
+    finally:
+        logger.setLevel(original_level)
+    return history
+
+
+def _rs_avg_dollar_volume(df: pd.DataFrame, window: int = RS_ONE_MONTH_WINDOW):
+    """Trailing `window`-session average dollar volume (share volume x
+    close price, averaged), used by RS_Groups' "liquid enough to trade
+    directly" highlight -- see RS_LIQUID_DOLLAR_VOLUME. Reuses the same
+    OHLCV history _fetch_rs_history already pulled rather than a
+    separate fetch. Returns None if `df` has no usable Volume column or
+    no rows in the window (rather than 0, which would read as "flat
+    zero," a real but very different thing from "unknown")."""
+    if df is None or 'Volume' not in df.columns:
+        return None
+    tail = df.tail(window)
+    dollar_vol = (tail['Close'] * tail['Volume']).dropna()
+    return float(dollar_vol.mean()) if len(dollar_vol) else None
 
 
 RS_SPARKLINE_WINDOW = 21
@@ -1003,9 +1206,12 @@ def _rs_metrics_for(df: pd.DataFrame, spy_df: pd.DataFrame = None, ticker: str =
     hist_series = rrs_slow_series.tail(RS_SPARKLINE_WINDOW).dropna()
     rs_spark = hist_series.round(4).tolist() if len(hist_series) else []
 
+    avg_dollar_volume = _rs_avg_dollar_volume(df)
+
     return {"price": round(last, 2), "pct_1d": pct_1d, "pct_1m": pct_1m,
             "pct_off_high": pct_off_high, "thrust": thrust, "onem_rrs": onem_rrs,
-            "price_spark": price_spark, "rs_spark": rs_spark}
+            "price_spark": price_spark, "rs_spark": rs_spark,
+            "avg_dollar_volume": avg_dollar_volume}
 
 
 def _rs_row(extra_fields, rec):
@@ -1023,7 +1229,7 @@ def _rs_row(extra_fields, rec):
     if rec is None:
         base.update({"Price": None, "RS Thrust": None, "1-Mth RRS": None,
                      "1D %": None, "1M %": None, "Off 52W High %": None,
-                     "_PriceSpark": [], "_RSSpark": []})
+                     "_PriceSpark": [], "_RSSpark": [], "_AvgDollarVolume": None})
     else:
         thrust, onem_rrs = rec["thrust"], rec["onem_rrs"]
         base.update({
@@ -1032,31 +1238,151 @@ def _rs_row(extra_fields, rec):
             "1-Mth RRS": round(onem_rrs, 2) if onem_rrs is not None else None,
             "1D %": rec["pct_1d"], "1M %": rec["pct_1m"], "Off 52W High %": rec["pct_off_high"],
             "_PriceSpark": rec["price_spark"], "_RSSpark": rec["rs_spark"],
+            "_AvgDollarVolume": rec.get("avg_dollar_volume"),
         })
     return base
 
 
+def _rs_is_liquid_enough(ticker: str, avg_dollar_volume, proxy_dollar_volume: dict = None) -> bool:
+    """RS_Groups' "liquid enough to trade directly" test: either the
+    ticker itself clears RS_LIQUID_DOLLAR_VOLUME on its own trailing-
+    month average dollar volume, or it has at least one high-confidence
+    leveraged ETF proxy (see LEVERAGED_ETF_PROXIES) whose OWN average
+    dollar volume ALSO clears that same bar -- a real fund that barely
+    trades isn't actually a usable proxy, so its liquidity has to be
+    checked too, not just the base ticker's. "Medium"-confidence
+    proxies (a real fund, but one that tracks a noticeably different
+    index than the base ticker) don't by themselves qualify a row --
+    they're still listed on the Leveraged_Proxies tab, just not treated
+    as an equivalent trade.
+
+    proxy_dollar_volume: {proxy_ticker: avg_dollar_volume} for every
+    ticker that appears anywhere in LEVERAGED_ETF_PROXIES (see
+    run_rs_dashboard, which fetches history for these the same way it
+    does for RS_GROUPS itself). Missing/None here reads as "unknown,"
+    not "liquid" -- an unverifiable proxy doesn't count."""
+    proxy_dollar_volume = proxy_dollar_volume or {}
+
+    def _proxy_is_liquid(p):
+        if p.get("confidence") != "high":
+            return False
+        v = proxy_dollar_volume.get(p["ticker"])
+        return v is not None and v >= RS_LIQUID_DOLLAR_VOLUME
+
+    has_liquid_proxy = any(_proxy_is_liquid(p) for p in LEVERAGED_ETF_PROXIES.get(ticker, []))
+    is_high_volume = avg_dollar_volume is not None and avg_dollar_volume >= RS_LIQUID_DOLLAR_VOLUME
+    return bool(has_liquid_proxy or is_high_volume)
+
+
+def build_leveraged_proxies_df(groups_df: pd.DataFrame = None, proxy_dollar_volume: dict = None) -> pd.DataFrame:
+    """One reference row per RS_GROUPS ticker: its theme name, whether
+    it clears the "liquid enough to trade directly" bar (see
+    _rs_is_liquid_enough), its own trailing-month average dollar volume
+    when available, and every known leveraged/inverse ETF proxy from
+    LEVERAGED_ETF_PROXIES (one row per proxy, so a ticker with two
+    proxies -- e.g. FXI's YINN/YANG -- gets two rows), each proxy row
+    also showing THAT proxy's own average dollar volume and whether it
+    clears the liquidity bar -- a proxy can be a real, well-matched fund
+    and still fail this if it barely trades. A ticker with no known
+    proxy still gets one row with the proxy columns blank, so the tab
+    is a complete checklist of all 47 tickers, not just the ones that
+    happen to have a match.
+
+    groups_df: RS_Groups' own DataFrame (from run_rs_dashboard), so the
+    real, just-fetched average dollar volume can be reused here instead
+    of re-deriving it. proxy_dollar_volume: {proxy_ticker: avg $ volume}
+    from that same run. Both optional so this still works standalone
+    (the volume/liquidity columns just read as unknown/blank)."""
+    proxy_dollar_volume = proxy_dollar_volume or {}
+    dollar_volume_by_ticker = {}
+    if groups_df is not None and not groups_df.empty:
+        for _, row in groups_df.iterrows():
+            dollar_volume_by_ticker[row["Ticker"]] = row.get("_AvgDollarVolume")
+
+    def _clean_volume(v):
+        if v is None or pd.isna(v):
+            return None
+        return round(float(v), 2)
+
+    rows = []
+    for ticker, name in RS_GROUPS:
+        avg_dollar_volume = _clean_volume(dollar_volume_by_ticker.get(ticker))
+        proxies = LEVERAGED_ETF_PROXIES.get(ticker, [])
+        liquid = _rs_is_liquid_enough(ticker, avg_dollar_volume, proxy_dollar_volume)
+        if proxies:
+            for p in proxies:
+                proxy_volume = _clean_volume(proxy_dollar_volume.get(p["ticker"]))
+                proxy_liquid = (p["confidence"] == "high" and proxy_volume is not None
+                                and proxy_volume >= RS_LIQUID_DOLLAR_VOLUME)
+                rows.append({
+                    "Ticker": ticker, "Theme": name,
+                    "Liquid Enough?": "YES" if liquid else "NO",
+                    "Avg $ Volume (1M)": avg_dollar_volume,
+                    "Proxy Ticker": p["ticker"], "Proxy Fund": p["fund"],
+                    "Leverage": p["leverage"], "Confidence": p["confidence"],
+                    "Proxy Avg $ Volume (1M)": proxy_volume,
+                    "Proxy Liquid?": "YES" if proxy_liquid else "NO",
+                    "Note": p["note"],
+                })
+        else:
+            rows.append({
+                "Ticker": ticker, "Theme": name,
+                "Liquid Enough?": "YES" if liquid else "NO",
+                "Avg $ Volume (1M)": avg_dollar_volume,
+                "Proxy Ticker": None, "Proxy Fund": None,
+                "Leverage": None, "Confidence": None,
+                "Proxy Avg $ Volume (1M)": None, "Proxy Liquid?": None,
+                "Note": None,
+            })
+    return pd.DataFrame(rows)
+
+
 def run_rs_dashboard():
     """Builds the RS_Groups and RS_Indices_Sectors tabs. Returns
-    (groups_df, indices_df); either can come back with some/all rows
-    blank (price data unavailable) rather than raising, matching this
-    project's usual degrade-visibly-not-silently philosophy.
+    (groups_df, indices_df, proxy_dollar_volume); either df can come
+    back with some/all rows blank (price data unavailable) rather than
+    raising, matching this project's usual degrade-visibly-not-silently
+    philosophy.
 
     Both "RS Thrust" and "1-Mth RRS" are Real Relative Strength (RRS)
     readings, self-referential (or self-vs-SPY) per ticker (see
     _rs_rrs) -- a row's numbers don't depend on any other row, so
     RS_Groups and RS_Indices_Sectors don't need separate whole-tab vs.
     per-category ranking universes here; each ticker is just computed
-    on its own."""
-    all_tickers = sorted(set([t for t, _ in RS_GROUPS] + [t for _, t, _ in RS_INDICES_SECTORS] + ["SPY"]))
+    on its own.
+
+    groups_df additionally carries a "_LiquidEnough" column (see
+    _rs_is_liquid_enough) that write_rs_groups_sheet reads to decide
+    which tickers get the yellow "liquid enough to trade directly"
+    highlight -- RS_Indices_Sectors doesn't get this treatment, so
+    indices_df has no such column.
+
+    proxy_dollar_volume ({ticker: avg $ volume}) covers every ticker
+    that appears anywhere in LEVERAGED_ETF_PROXIES -- a leveraged proxy
+    only counts toward "liquid enough" if IT is also liquid, not just
+    the base ticker, so its own history has to be pulled too. Returned
+    (rather than kept internal) so build_leveraged_proxies_df can show
+    each proxy's own volume/liquidity on the Leveraged_Proxies tab
+    without a second, duplicate fetch."""
+    proxy_tickers = {p["ticker"] for proxies in LEVERAGED_ETF_PROXIES.values() for p in proxies}
+    all_tickers = sorted(set([t for t, _ in RS_GROUPS] + [t for _, t, _ in RS_INDICES_SECTORS]
+                              + list(proxy_tickers) + ["SPY"]))
     history = _fetch_rs_history(all_tickers)
     spy_df = history.get("SPY")  # full OHLC DataFrame -- RRS needs SPY's High/Low too, not just Close
+
+    proxy_dollar_volume = {
+        t: _rs_avg_dollar_volume(history[t]) for t in proxy_tickers if t in history
+    }
 
     g_records = [(_rs_metrics_for(history[ticker], spy_df, ticker) if ticker in history else None) for ticker, _ in RS_GROUPS]
     groups_df = pd.DataFrame([
         _rs_row({"Ticker": ticker, "Name": name}, rec)
         for (ticker, name), rec in zip(RS_GROUPS, g_records)
     ])
+    groups_df["_LiquidEnough"] = [
+        _rs_is_liquid_enough(ticker, rec.get("avg_dollar_volume") if rec else None, proxy_dollar_volume)
+        for (ticker, _), rec in zip(RS_GROUPS, g_records)
+    ]
 
     indices_rows = []
     current_category = None
@@ -1079,7 +1405,453 @@ def run_rs_dashboard():
     n_priced = sum(1 for r in g_records if r is not None) + sum(1 for row in indices_rows if row.get("Price") is not None)
     n_total = len(g_records) + len(indices_rows)
     print(f"Finished RS Dashboard: {n_priced}/{n_total} tickers priced.")
-    return groups_df, indices_df
+    return groups_df, indices_df, proxy_dollar_volume
+
+
+# =====================================================================
+# TREND TEMPLATE SCAN (N-Value / Bucket scoring)
+# ---------------------------------------------------------------------
+# An 11-rule stock screener, reproduced from a 12-rule set (plus 2
+# index-level "Market Direction" rules that aren't implemented here --
+# see below) the user sourced from a third-party
+# website (see the uploaded sample CSV this was reverse-engineered
+# from) -- minus that source's "Institutional Ownership >= 5%" rule
+# (n=12 originally), which is dropped here entirely: TradingView's
+# screener silently returns null for an unrecognized field instead of
+# erroring, so a first attempt at this rule (a guessed field name that
+# almost certainly doesn't exist) came back reading as a false FAIL on
+# every single stock rather than a detectable error -- worse than not
+# having the rule at all. Every stock is scored two ways rather than
+# simple pass/fail:
+#
+#   - N-Value Rating: each rule is worth 2**n (n = the source site's
+#     own original numbering, 1-12 minus the dropped 4 -- see
+#     TT_RULE_NVALUES). A stock's N-Value Rating is the sum of 2**n
+#     over every rule it PASSES. Range: 0 (fails everything) to
+#     TT_MAX_NVALUE (passes everything) -- lower than the source
+#     site's own 8190 max since one rule's weight (2**4 = 16) is
+#     permanently missing.
+#   - Bucket Rating: for each rule, how far past (or short of) its
+#     passing threshold the stock's actual value is, as a fraction of
+#     that threshold, multiplied by the rule's own 2**n weight -- so
+#     barely passing contributes little and passing by a wide margin
+#     contributes a lot, even between two stocks that pass the exact
+#     same set of rules. Every rule uses this SAME percent-over-
+#     threshold formula (see _tt_percent_over/_tt_rule_score) --
+#     including Liquidity and Previous-Close, where the source site's
+#     own sample data didn't fit that formula (its Liquidity score was
+#     always 0 and its Previous-Close score was always a flat max
+#     value). That formula is capped per-rule at TT_MAX_PERCENT_OVER
+#     (see _tt_rule_score) -- without a cap, Liquidity's $20M floor and
+#     Previous-Close's $10 floor are both so low that a normal stock
+#     clears them by 10-50x, not the 15-20% a moving-average rule
+#     typically clears its own threshold by, so those two rules alone
+#     were dominating two-thirds or more of the total score. The one
+#     rule that keeps a fixed 0 Bucket contribution on purpose,
+#     uncapped or not, is 200d-MA-Rising: it's a pass/fail streak check
+#     with no underlying "percent over threshold" to measure at all
+#     (see below).
+#
+# Two rules need a full year of daily price history rather than a
+# single TradingView snapshot value -- Relative Strength (an EMA of a
+# daily-return ratio vs SPY) and whether the 200-day MA has been
+# rising for 21 straight sessions -- the same constraint the RS
+# Dashboard above has, and for the same reason: pulling that much
+# history for the whole market is slow. So this scan runs in two
+# stages: one TradingView query applies every OTHER rule (plus a
+# broad-but-real universe filter) first, and only the tickers that
+# query returns get a batched yfinance history pull for those two
+# history-dependent rules.
+#
+# The source site's two index-level "Market Direction" rules (21d MA >
+# 50d MA, 50d MA rising for 21 sessions) were tried as an informational
+# readout on the Summary tab, separate from the per-stock scan, but
+# removed at the user's request -- SPY's own history wasn't reliably
+# available in their environment, so it just sat there reading "N/A."
+# Nothing about the 11-rule stock scan above depends on it.
+# =====================================================================
+
+# (rule key -> n-value), using the source site's own original numbering
+# (1-12) with 4 (Institutional Ownership) permanently absent -- see the
+# section header for why. 2**n is both the N-Value Rating a passing
+# rule contributes AND the Bucket Rating weight (before the
+# TT_MAX_PERCENT_OVER cap) that rule's percent-over-threshold gets
+# multiplied by.
+TT_RULE_NVALUES = {
+    'sma50_gt_sma150': 12,
+    'sma150_gt_sma200': 11,
+    'week52_span': 10,
+    'relative_strength': 9,
+    'liquidity': 8,
+    'close_above_52w_high_25pct': 7,
+    'prev_close_above_10': 6,
+    'sma200_rising_21d': 5,
+    'close_above_sma50': 3,
+    'sales_qoq_yoy': 2,
+    'eps_qoq_yoy': 1,
+}
+
+# Friendly labels for each rule's PASS/FAIL column on the tab.
+TT_RULE_LABELS = {
+    'sma50_gt_sma150': 'SMA50 > SMA150',
+    'sma150_gt_sma200': 'SMA150 > SMA200',
+    'week52_span': '52W High/Low Span',
+    'relative_strength': 'Relative Strength > 1.0',
+    'liquidity': 'Liquidity >= $20M',
+    'close_above_52w_high_25pct': 'Within 25% of 52W High',
+    'prev_close_above_10': 'Prev Close > $10',
+    'sma200_rising_21d': '200d MA Rising (21d)',
+    'close_above_sma50': 'Close > SMA50',
+    'sales_qoq_yoy': 'Sales QoQ YoY > 25%',
+    'eps_qoq_yoy': 'EPS QoQ YoY > 18%',
+}
+
+# Fixed walk order for every place that needs to iterate all 11 rules
+# (column layout, total-score calcs, etc) -- n=12 down to n=1, skipping
+# the dropped n=4.
+TT_RULE_ORDER = list(TT_RULE_NVALUES.keys())
+
+# Max possible N-Value Rating (every rule passed) -- lower than the
+# source site's own 8190 since n=4 (Institutional Ownership) is gone.
+TT_MAX_NVALUE = sum(2 ** n for n in TT_RULE_NVALUES.values())
+
+# Cap on how far past its own threshold a single rule's Bucket Rating
+# contribution can count, as a multiple of the threshold itself (2.0 =
+# 200% over) -- see the section header for why this exists. Applied
+# uniformly to every rule in _tt_rule_score, not just Liquidity/
+# Previous-Close, so there's still only one formula, just a bounded one.
+TT_MAX_PERCENT_OVER = 2.0
+
+# Universe scoping for the initial TradingView query. The universe is
+# EVERY US-listed stock that clears the market-cap / volume floors below,
+# ordered by market cap -- NOT by the day's % change. (An earlier version
+# sorted by 'change' and kept 500 rows, which silently limited the scan
+# to that day's biggest gainers; strong stocks having a flat/down day,
+# e.g. NVDA, never got scored at all.) The limit is set well above the
+# number of stocks that actually pass these floors (~2,000-2,500), so in
+# practice nothing gets cut off; if the console ever reports hitting it,
+# raise it. The day's % change is still shown, as its own column.
+TT_MIN_MARKET_CAP = 800_000_000
+TT_MIN_AVG_VOLUME = 300_000
+TT_UNIVERSE_LIMIT = 5000
+
+# Sectors left out of Trend_Template entirely. Matched case-insensitively
+# against the START of TradingView's sector name, so "health" catches
+# Health Technology AND Health Services (and any future "Health ..."
+# sector), and "financ" catches Finance (banks, insurance, REITs, etc.)
+# plus "Financial ..." spellings. Stocks with no sector listed are kept.
+# To exclude another sector, add the start of its name here in lowercase.
+TT_EXCLUDED_SECTOR_PREFIXES = ('financ', 'health', 'utilities', 'retail', 'consumer')
+
+# Stage-2 price history (Relative Strength + 200d-MA-Rising). 2 years of
+# daily bars gives the 200-day SMA ~300 valid points -- comfortably more
+# than the 221 (200 + 21) the rising-streak check needs -- and the
+# download is split into chunks so one throttled/failed batch only costs
+# those tickers, not the whole scan.
+TT_HISTORY_PERIOD = "2y"
+TT_HISTORY_CHUNK = 200
+TT_SMA200_MIN_BARS = 200 + 21
+
+# The source site's Liquidity rule wants "SMA50_volume" -- a 50-day
+# average volume. That specific field isn't a confirmed TradingView
+# name in this project; 'average_volume_60d_calc' is (used throughout
+# the rest of this file already), so it stands in here as the closest
+# proven equivalent: SMA50 (price) x 60-day average volume, rather
+# than x 50-day.
+TT_LIQUIDITY_VOLUME_FIELD = 'average_volume_60d_calc'
+
+
+def _tt_percent_over(actual, threshold):
+    """(actual - threshold) / threshold -- the Bucket Rating's "percent
+    difference between the actual value and the passing threshold,"
+    shared by every rule below (see the section header for why this
+    one formula is used for all twelve). `actual` is always a Series;
+    `threshold` may be one too (comparing two moving averages) or a
+    plain number (e.g. the $10 Previous-Close floor). A zero threshold
+    is treated as undefined (NA) rather than raising a divide-by-zero,
+    and +-inf results (a near-zero threshold with a nonzero actual)
+    collapse to NA the same way."""
+    if isinstance(threshold, pd.Series):
+        denom = threshold.mask(threshold == 0)
+    else:
+        denom = pd.NA if threshold == 0 else threshold
+    ratio = (actual - threshold) / denom
+    if isinstance(ratio, pd.Series):
+        ratio = ratio.replace([float('inf'), float('-inf')], pd.NA)
+    return ratio
+
+
+def _tt_safe_round(series: pd.Series, ndigits: int) -> pd.Series:
+    """Round a Series to ndigits, tolerating an all-NA (object-dtype)
+    placeholder Series -- pd.NA has no __round__, so a plain .round()
+    raises on the "field wasn't available this run" columns
+    run_trend_template builds. pd.to_numeric coerces those to a proper
+    all-NaN float64 Series first, which .round() handles fine; a
+    Series that's already numeric passes through unaffected."""
+    return pd.to_numeric(series, errors='coerce').round(ndigits)
+
+
+def _tt_rule_score(passed: pd.Series, percent_over: pd.Series, n_value: int) -> pd.Series:
+    """A rule's Bucket Rating contribution: percent_over (capped at
+    TT_MAX_PERCENT_OVER -- see the section header) x 2**n_value if it
+    passed, 0 otherwise -- including wherever the metric needed for it
+    wasn't available at all, and never negative for a failing rule (a
+    stock that fails still keeps whatever it earned from the rules it
+    DOES pass)."""
+    weight = 2 ** n_value
+    passed_bool = passed.fillna(False).astype(bool)
+    capped = percent_over.fillna(0.0).clip(upper=TT_MAX_PERCENT_OVER)
+    contribution = capped * weight
+    return contribution.where(passed_bool, 0.0)
+
+
+def run_trend_template():
+    """The 11-rule Trend Template N-Value/Bucket scoring scan (see the
+    section header above) against a broad TradingView stock universe.
+    Relative Strength and 200d-MA-Rising are computed in a second pass
+    over just the tickers the initial query returns (see the section
+    header for why)."""
+    name = "Trend_Template"
+    risky_fields = ['SMA50', 'SMA150', 'SMA200', 'price_52_week_high', TT_LIQUIDITY_VOLUME_FIELD]
+    where_conditions = [
+        col('type') == 'stock',
+        col('exchange').isin(['NASDAQ', 'NYSE', 'AMEX']),
+        col('market_cap_basic') > TT_MIN_MARKET_CAP,
+        col('average_volume_60d_calc') > TT_MIN_AVG_VOLUME,
+    ]
+
+    df = None
+    try:
+        fields = STANDARD_DISPLAY_FIELDS + risky_fields
+        query = _build_query(fields, where_conditions, 'market_cap_basic', False, TT_UNIVERSE_LIMIT)
+        _, df = query.get_scanner_data()
+    except Exception as e:
+        print(f"Warning: {name}'s full field set failed ({e}); retrying with a minimal field "
+              f"set -- SMA150/SMA200/52-week-high will all be left blank/not evaluated this run.")
+        try:
+            fields = SAFE_FALLBACK_FIELDS + ['SMA50', TT_LIQUIDITY_VOLUME_FIELD]
+            query = _build_query(fields, where_conditions, 'market_cap_basic', False, TT_UNIVERSE_LIMIT)
+            _, df = query.get_scanner_data()
+        except Exception as e2:
+            print(f"Error in {name}: {e2}")
+            return name, pd.DataFrame()
+
+    if df is None or df.empty:
+        return name, pd.DataFrame()
+
+    print(f"{name}: universe = {len(df)} stocks (market cap > ${TT_MIN_MARKET_CAP / 1e6:,.0f}M, "
+          f"60d avg volume > {TT_MIN_AVG_VOLUME:,}).")
+    if len(df) >= TT_UNIVERSE_LIMIT:
+        print(f"Warning: {name} hit TT_UNIVERSE_LIMIT ({TT_UNIVERSE_LIMIT}) -- the smallest stocks "
+              f"that qualify were cut off. Raise TT_UNIVERSE_LIMIT to include them.")
+
+    # Drop excluded sectors (Finance, Health Technology, Health Services,
+    # ...) BEFORE the Yahoo history pull, so they don't cost download time.
+    if 'sector' in df.columns:
+        sector_norm = df['sector'].fillna('').astype(str).str.strip().str.lower()
+        excluded = sector_norm.str.startswith(TT_EXCLUDED_SECTOR_PREFIXES)
+        if excluded.any():
+            dropped = df.loc[excluded, 'sector'].value_counts()
+            print(f"{name}: excluded {int(excluded.sum())} stocks by sector -- "
+                  + ", ".join(f"{s} ({n})" for s, n in dropped.items()))
+        df = df[~excluded]
+        if df.empty:
+            return name, pd.DataFrame()
+    else:
+        print(f"Warning: {name} got no 'sector' field from TradingView this run -- "
+              f"the Finance/Health sector exclusion could NOT be applied.")
+
+    df = df.copy()
+    has_sma150 = 'SMA150' in df.columns
+    has_sma200 = 'SMA200' in df.columns
+    has_52w_high = 'price_52_week_high' in df.columns
+
+    passed = pd.DataFrame(index=df.index)
+    scores = pd.DataFrame(index=df.index)
+
+    if has_sma150:
+        passed['sma50_gt_sma150'] = df['SMA50'] > df['SMA150']
+        scores['sma50_gt_sma150'] = _tt_rule_score(
+            passed['sma50_gt_sma150'], _tt_percent_over(df['SMA50'], df['SMA150']), TT_RULE_NVALUES['sma50_gt_sma150'])
+    else:
+        passed['sma50_gt_sma150'] = pd.NA
+        scores['sma50_gt_sma150'] = 0.0
+
+    if has_sma150 and has_sma200:
+        passed['sma150_gt_sma200'] = df['SMA150'] > df['SMA200']
+        scores['sma150_gt_sma200'] = _tt_rule_score(
+            passed['sma150_gt_sma200'], _tt_percent_over(df['SMA150'], df['SMA200']), TT_RULE_NVALUES['sma150_gt_sma200'])
+    else:
+        passed['sma150_gt_sma200'] = pd.NA
+        scores['sma150_gt_sma200'] = 0.0
+
+    if has_52w_high:
+        span_actual = 0.75 * df['price_52_week_high']
+        span_threshold = 1.25 * df['price_52_week_low']
+        passed['week52_span'] = span_actual > span_threshold
+        scores['week52_span'] = _tt_rule_score(
+            passed['week52_span'], _tt_percent_over(span_actual, span_threshold), TT_RULE_NVALUES['week52_span'])
+    else:
+        passed['week52_span'] = pd.NA
+        scores['week52_span'] = 0.0
+
+    if 'SMA50' in df.columns and TT_LIQUIDITY_VOLUME_FIELD in df.columns:
+        liquidity_value = df['SMA50'] * df[TT_LIQUIDITY_VOLUME_FIELD]
+        passed['liquidity'] = liquidity_value >= 20_000_000
+        scores['liquidity'] = _tt_rule_score(
+            passed['liquidity'], _tt_percent_over(liquidity_value, 20_000_000), TT_RULE_NVALUES['liquidity'])
+    else:
+        liquidity_value = pd.Series(pd.NA, index=df.index)
+        passed['liquidity'] = pd.NA
+        scores['liquidity'] = 0.0
+
+    if has_52w_high:
+        threshold = 0.75 * df['price_52_week_high']
+        passed['close_above_52w_high_25pct'] = df['close'] > threshold
+        scores['close_above_52w_high_25pct'] = _tt_rule_score(
+            passed['close_above_52w_high_25pct'], _tt_percent_over(df['close'], threshold), TT_RULE_NVALUES['close_above_52w_high_25pct'])
+    else:
+        passed['close_above_52w_high_25pct'] = pd.NA
+        scores['close_above_52w_high_25pct'] = 0.0
+
+    passed['prev_close_above_10'] = df['close'] > 10
+    scores['prev_close_above_10'] = _tt_rule_score(
+        passed['prev_close_above_10'], _tt_percent_over(df['close'], 10), TT_RULE_NVALUES['prev_close_above_10'])
+
+    if 'SMA50' in df.columns:
+        passed['close_above_sma50'] = df['close'] > df['SMA50']
+        scores['close_above_sma50'] = _tt_rule_score(
+            passed['close_above_sma50'], _tt_percent_over(df['close'], df['SMA50']), TT_RULE_NVALUES['close_above_sma50'])
+    else:
+        passed['close_above_sma50'] = pd.NA
+        scores['close_above_sma50'] = 0.0
+
+    if 'total_revenue_yoy_growth_fq' in df.columns:
+        passed['sales_qoq_yoy'] = df['total_revenue_yoy_growth_fq'] > 25
+        scores['sales_qoq_yoy'] = _tt_rule_score(
+            passed['sales_qoq_yoy'], _tt_percent_over(df['total_revenue_yoy_growth_fq'], 25), TT_RULE_NVALUES['sales_qoq_yoy'])
+    else:
+        passed['sales_qoq_yoy'] = pd.NA
+        scores['sales_qoq_yoy'] = 0.0
+
+    if 'earnings_per_share_diluted_yoy_growth_fq' in df.columns:
+        passed['eps_qoq_yoy'] = df['earnings_per_share_diluted_yoy_growth_fq'] > 18
+        scores['eps_qoq_yoy'] = _tt_rule_score(
+            passed['eps_qoq_yoy'], _tt_percent_over(df['earnings_per_share_diluted_yoy_growth_fq'], 18), TT_RULE_NVALUES['eps_qoq_yoy'])
+    else:
+        passed['eps_qoq_yoy'] = pd.NA
+        scores['eps_qoq_yoy'] = 0.0
+
+    # -- Stage 2: Relative Strength and 200d-MA-Rising, both of which
+    # need a year of daily history rather than a single snapshot value.
+    # Only pulled for tickers this query already returned -- SPY comes
+    # along as the RS benchmark.
+    tickers = df['name'].dropna().unique().tolist()
+    history = _fetch_tt_history(tickers + ['SPY']) if tickers else {}
+    spy_df = history.get('SPY')
+    if spy_df is None:
+        print(f"Warning: {name} couldn't get SPY history -- Relative Strength will be N/A for every stock this run.")
+
+    rs_values, sma200_rising, sma200_days_up = [], [], []
+    for ticker in df['name']:
+        rec_rs, rec_slope, rec_days = None, None, None
+        t_df = history.get(ticker)
+        if t_df is not None and spy_df is not None:
+            try:
+                close = t_df['Close']
+                ret = close.pct_change()
+                spy_close = spy_df['Close'].reindex(close.index)
+                spy_ret = spy_close.pct_change()
+                # NOTE: this is a ratio of two daily returns, exactly as
+                # the source rule defines it -- inherently noisy on any
+                # day SPY's own move is near zero. That noise is a
+                # property of the rule itself, not a bug here.
+                # pd.to_numeric: _safe_ratio marks a zero-return SPY day
+                # as pd.NA, which turns the Series into object dtype and
+                # makes .ewm() raise -- previously that silently blanked
+                # RS for EVERY stock whenever SPY had one unchanged day in
+                # the lookback. Coercing back to float64 (NA -> NaN) fixes
+                # it; ewm just skips the NaN day.
+                ratio = pd.to_numeric(_safe_ratio(ret, spy_ret), errors='coerce')
+                ema60 = ratio.ewm(span=60, adjust=False, min_periods=60, ignore_na=True).mean()
+                if pd.notna(ema60.iloc[-1]):
+                    rec_rs = float(ema60.iloc[-1])
+            except Exception:
+                rec_rs = None
+        if t_df is not None:
+            try:
+                closes = t_df['Close'].dropna()
+                if len(closes) >= TT_SMA200_MIN_BARS:
+                    sma200 = closes.rolling(200).mean()
+                    diffs = sma200.diff().tail(RS_ONE_MONTH_WINDOW)
+                    if len(diffs) == RS_ONE_MONTH_WINDOW and diffs.notna().all():
+                        rec_days = int((diffs > 0).sum())
+                        rec_slope = rec_days == RS_ONE_MONTH_WINDOW
+            except Exception:
+                rec_slope, rec_days = None, None
+        rs_values.append(rec_rs)
+        sma200_rising.append(rec_slope)
+        sma200_days_up.append(rec_days)
+
+    no_history = sum(1 for v in sma200_rising if v is None)
+    if no_history:
+        print(f"Note: {name}: 200d-MA-Rising is N/A for {no_history} of {len(df)} stocks "
+              f"(no Yahoo history, or under {TT_SMA200_MIN_BARS} trading days -- e.g. recent IPOs).")
+
+    df['Relative_Strength_Value'] = rs_values
+    df['SMA200_Days_Rising'] = pd.Series(sma200_days_up, index=df.index, dtype='Int64')
+    passed['relative_strength'] = df['Relative_Strength_Value'] > 1.0
+    scores['relative_strength'] = _tt_rule_score(
+        passed['relative_strength'], _tt_percent_over(df['Relative_Strength_Value'], 1.0), TT_RULE_NVALUES['relative_strength'])
+
+    df['SMA200_Rising_21d'] = pd.Series(sma200_rising, index=df.index).astype('boolean')
+    passed['sma200_rising_21d'] = df['SMA200_Rising_21d']
+    # No natural "percent over threshold" for a streak-consistency check
+    # (see the section header) -- contributes to the N-Value Rating only.
+    scores['sma200_rising_21d'] = 0.0
+
+    n_value_rating = sum(
+        passed[rule].fillna(False).astype(int) * (2 ** TT_RULE_NVALUES[rule])
+        for rule in TT_RULE_ORDER
+    )
+    bucket_rating = scores[TT_RULE_ORDER].sum(axis=1)
+    rules_passed = passed[TT_RULE_ORDER].apply(lambda c: c.fillna(False)).sum(axis=1)
+
+    # Rounded before it ever reaches the DataFrame -- not just cosmetic:
+    # unrounded floats from these calculations (e.g. SMA50 x volume, or
+    # 0.75 x price_52_week_high) often carry tiny binary-float noise
+    # (928.5500000000001, not 928.55), and _fit_column sizes a column's
+    # width off str(value) whenever its header isn't one it specially
+    # recognizes -- so that noise was making these columns dramatically
+    # wider than the 2-decimal number actually shown in each cell.
+    na_col = pd.Series(pd.NA, index=df.index)
+    out = pd.DataFrame({
+        'name': df['name'],
+        'N_Value_Rating': n_value_rating,
+        'Bucket_Rating': bucket_rating.round(2),
+        'Rules_Passed': rules_passed,
+        'close': _tt_safe_round(df['close'], 2),
+        'change': _tt_safe_round(df['change'] if 'change' in df.columns else na_col, 2),
+        'SMA200_Days_Rising': df['SMA200_Days_Rising'],
+        'sector': df.get('sector'),
+        'industry': df.get('industry'),
+        'market_cap_basic': df.get('market_cap_basic'),
+        'SMA50': _tt_safe_round(df['SMA50'] if 'SMA50' in df.columns else na_col, 2),
+        'SMA150': _tt_safe_round(df['SMA150'] if has_sma150 else na_col, 2),
+        'SMA200': _tt_safe_round(df['SMA200'] if has_sma200 else na_col, 2),
+        'price_52_week_high': _tt_safe_round(df['price_52_week_high'] if has_52w_high else na_col, 2),
+        'price_52_week_low': _tt_safe_round(df['price_52_week_low'] if 'price_52_week_low' in df.columns else na_col, 2),
+        'Relative_Strength_Value': _tt_safe_round(df['Relative_Strength_Value'], 3),
+        'Liquidity_Value': _tt_safe_round(liquidity_value, 2),
+        'Sales_QoQ_YoY': _tt_safe_round(df['total_revenue_yoy_growth_fq'] if 'total_revenue_yoy_growth_fq' in df.columns else na_col, 2),
+        'EPS_QoQ_YoY': _tt_safe_round(df['earnings_per_share_diluted_yoy_growth_fq'] if 'earnings_per_share_diluted_yoy_growth_fq' in df.columns else na_col, 2),
+    })
+    for rule in TT_RULE_ORDER:
+        out[f'Pass_{rule}'] = passed[rule]
+
+    out = out.sort_values(by='Bucket_Rating', ascending=False, na_position='last', kind='stable').reset_index(drop=True)
+    print(f"Finished {name}: {len(out)} tickers scored.")
+    return name, out
 
 
 # =====================================================================
@@ -1100,6 +1872,8 @@ COLOR_SCALE_HIGH = "5B7C99"     # slate-blue = high/positive end of a metric
 COLOR_ZEBRA = "F5F6F7"          # subtle zebra-stripe fill
 COLOR_MATCH_FILL = "E7ECEF"     # soft slate tint for Status == MATCH (good)
 COLOR_NOMATCH_FILL = "FCE8D6"   # soft orange tint for Status == NO MATCH (bad)
+COLOR_LIQUID_HIGHLIGHT = "FFF3B0"  # soft yellow -- RS_Groups Ticker cells for tickers that
+                                    # are "liquid enough to trade directly" (see RS_LIQUID_DOLLAR_VOLUME)
 
 # ---- Friendly column names shown in Excel (raw field -> readable label) ----
 FRIENDLY_NAMES = {
@@ -1150,7 +1924,7 @@ PERCENT_COLUMNS = {
     'Off 52W High %',
 }
 # Abbreviated (K/M/B) dollar formats, per the user's request
-ABBREVIATED_CURRENCY_COLUMNS = {'Market Cap', '$ Volume'}
+ABBREVIATED_CURRENCY_COLUMNS = {'Market Cap', '$ Volume', 'Avg $ Volume (1M)', 'Proxy Avg $ Volume (1M)'}
 INTEGER_COLUMNS = {'Volume', 'Float'}
 PRICE_COLUMNS = {'Price'}
 # "RS Thrust" / "1-Mth RRS" are Real Relative Strength readings (see the
@@ -1354,6 +2128,13 @@ def _fit_column(ws, workbook, fmt_cache, col_idx, header, values, n_rows, apply_
             nomatch_fmt = _get_format(workbook, fmt_cache, ('status', 'nomatch'), {'bg_color': _hex(COLOR_NOMATCH_FILL)})
             ws.conditional_format(1, col_idx, n_rows, col_idx, {'type': 'cell', 'criteria': 'equal to', 'value': '"MATCH"', 'format': match_fmt})
             ws.conditional_format(1, col_idx, n_rows, col_idx, {'type': 'cell', 'criteria': 'equal to', 'value': '"NO MATCH"', 'format': nomatch_fmt})
+        if header in ('Liquid Enough?', 'Proxy Liquid?'):
+            # Same yellow used for RS_Groups' own "liquid enough to trade
+            # directly" Ticker-cell highlight (see COLOR_LIQUID_HIGHLIGHT)
+            # -- so the Leveraged_Proxies tab visually matches the tab
+            # it's a reference for.
+            liquid_fmt = _get_format(workbook, fmt_cache, ('liquid', 'yes'), {'bg_color': _hex(COLOR_LIQUID_HIGHLIGHT)})
+            ws.conditional_format(1, col_idx, n_rows, col_idx, {'type': 'cell', 'criteria': 'equal to', 'value': '"YES"', 'format': liquid_fmt})
 
     return lines_needed
 
@@ -1485,8 +2266,20 @@ def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool, col
 
     col_offset shifts every column this writes by that many columns --
     see write_rs_flat_sheet, whose leading identifying columns (written
-    separately, by _rs_write_group_cells) occupy columns [0, col_offset)."""
+    separately, by _rs_write_group_cells) occupy columns [0, col_offset).
+
+    row_dict["_LiquidEnough"], when present and truthy (RS_Groups only
+    -- see run_rs_dashboard), paints just the Ticker cell with
+    COLOR_LIQUID_HIGHLIGHT instead of its normal zebra shading; every
+    other cell in the row keeps the ordinary zebra pattern. Baking this
+    into the Ticker cell's own format at write time (rather than a
+    conditional-formatting rule) means it's real cell formatting, so it
+    travels correctly with the row if the sheet's own Excel Table is
+    later re-sorted by hand -- same as the zebra shading and bold
+    Ticker formatting already do."""
+    highlight = bool(row_dict.get("_LiquidEnough"))
     zebra_bg = {'bg_color': _hex(COLOR_ZEBRA)} if zebra else {}
+    ticker_bg = {'bg_color': _hex(COLOR_LIQUID_HIGHLIGHT)} if highlight else zebra_bg
     for i, header in enumerate(RS_TAB_HEADERS):
         c = col_offset + i
         if header in ("1-Mth Chart", "1-Mth RS"):
@@ -1496,7 +2289,7 @@ def _rs_write_row(ws, workbook, fmt_cache, row, row_dict: dict, zebra: bool, col
         value = row_dict.get(header)
         is_missing = value is None or (isinstance(value, float) and pd.isna(value))
         if header == "Ticker":
-            fmt = _get_format(workbook, fmt_cache, ('rs', 'ticker', zebra), dict(zebra_bg, bold=True))
+            fmt = _get_format(workbook, fmt_cache, ('rs', 'ticker', zebra, highlight), dict(ticker_bg, bold=True))
             ws.write_string(row, c, str(value), fmt)
         elif is_missing:
             fmt = _get_format(workbook, fmt_cache, ('rs', 'na', zebra),
@@ -1749,6 +2542,109 @@ def write_rs_indices_sheet(workbook, fmt_cache: dict, df: pd.DataFrame, sheet_na
     return ws
 
 
+def write_trend_template_sheet(workbook, fmt_cache: dict, df: pd.DataFrame):
+    """Trend_Template: the 11-rule N-Value/Bucket-score screener (see
+    the TREND TEMPLATE SCAN section header for the full rules and
+    scoring, and run_trend_template for how the DataFrame is built).
+    Bespoke writer (not write_metric_sheet) because this tab's columns --
+    two composite scores, a passed-rule count, eleven PASS/FAIL
+    columns, then the raw supporting values -- don't match the fixed
+    schema every other scan tab shares; same reasoning as
+    RS_Groups/RS_Indices_Sectors having their own writers.
+
+    Default row order: sorted by Bucket Rating descending (see
+    run_trend_template) -- the sortable header (autofilter) lets it be
+    re-sorted by hand at any time, same as every other tab."""
+    if df is None or df.empty:
+        return None
+
+    display = pd.DataFrame({
+        'Ticker': df['name'],
+        'N-Value Score': df['N_Value_Rating'],
+        'Bucket Score': df['Bucket_Rating'],
+        'Rules Passed': df['Rules_Passed'],
+        'Price': df['close'],
+        '1D %': df['change'],
+        'Sector': df['sector'],
+        'Industry': df['industry'],
+        'Market Cap': df['market_cap_basic'],
+    })
+    for r in TT_RULE_ORDER:
+        display[TT_RULE_LABELS[r]] = df[f'Pass_{r}'].map(lambda v: 'N/A' if pd.isna(v) else ('PASS' if v else 'FAIL'))
+    display['SMA50'] = df['SMA50']
+    display['SMA150'] = df['SMA150']
+    display['SMA200'] = df['SMA200']
+    display['52W High'] = df['price_52_week_high']
+    display['52W Low'] = df['price_52_week_low']
+    display['Relative Strength (EMA60)'] = df['Relative_Strength_Value']
+    display['200d MA Days Rising (of 21)'] = df['SMA200_Days_Rising']
+    display['Liquidity ($)'] = df['Liquidity_Value']
+    display['Sales QoQ YoY %'] = df['Sales_QoQ_YoY']
+    display['EPS QoQ YoY %'] = df['EPS_QoQ_YoY']
+
+    n_rows, n_cols = len(display), len(display.columns)
+    if n_rows == 0 or n_cols == 0:
+        return None
+    ws = workbook.add_worksheet('Trend_Template')
+    headers = list(display.columns)
+    header_fmt = _header_format(workbook, fmt_cache)
+    for c, header in enumerate(headers):
+        ws.write(0, c, header, header_fmt)
+
+    pass_fail_headers = {TT_RULE_LABELS[r] for r in TT_RULE_ORDER}
+    percent_headers = {'1D %', 'Sales QoQ YoY %', 'EPS QoQ YoY %'}
+    price_headers = {'Price', 'SMA50', 'SMA150', 'SMA200', '52W High', '52W Low'}
+    currency_headers = {'Market Cap', 'Liquidity ($)'}
+    ratio_headers = {'Relative Strength (EMA60)'}
+    integer_headers = {'Rules Passed', 'N-Value Score', '200d MA Days Rising (of 21)'}
+
+    def numfmt_for(header):
+        if header in pass_fail_headers or header in ('Ticker', 'Sector', 'Industry'):
+            return None
+        if header == 'Bucket Score':
+            return '#,##0.00'
+        if header in integer_headers:
+            return '#,##0'
+        if header in percent_headers:
+            return '0.00"%"'
+        if header in currency_headers:
+            return ABBREVIATED_CURRENCY_FORMAT
+        if header in price_headers or header in ratio_headers:
+            return '0.00'
+        return None
+
+    max_header_lines = 1
+    for c, header in enumerate(headers):
+        numfmt = numfmt_for(header)
+        plain_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=False)
+        zebra_fmt = _data_format(workbook, fmt_cache, numfmt, zebra=True)
+        col_values = display.iloc[:, c].tolist()
+        for r, value in enumerate(col_values):
+            fmt = zebra_fmt if r % 2 == 0 else plain_fmt
+            _write_cell(ws, r + 1, c, value, fmt)
+        lines_needed = _fit_column(ws, workbook, fmt_cache, c, header, col_values, n_rows, apply_conditional=False)
+        max_header_lines = max(max_header_lines, lines_needed)
+
+        if header in pass_fail_headers:
+            match_fmt = _get_format(workbook, fmt_cache, ('status', 'match'), {'bg_color': _hex(COLOR_MATCH_FILL)})
+            nomatch_fmt = _get_format(workbook, fmt_cache, ('status', 'nomatch'), {'bg_color': _hex(COLOR_NOMATCH_FILL)})
+            ws.conditional_format(1, c, n_rows, c, {'type': 'cell', 'criteria': 'equal to', 'value': '"PASS"', 'format': match_fmt})
+            ws.conditional_format(1, c, n_rows, c, {'type': 'cell', 'criteria': 'equal to', 'value': '"FAIL"', 'format': nomatch_fmt})
+        elif header in ('N-Value Score', 'Bucket Score', '1D %'):
+            # '1D %' gets the same orange -> grey -> slate-blue scale it
+            # has on every other tab (see _fit_column / PERCENT_COLUMNS).
+            ws.conditional_format(1, c, n_rows, c, {
+                'type': '3_color_scale',
+                'min_color': _hex(COLOR_SCALE_LOW), 'mid_color': _hex(COLOR_SCALE_MID), 'max_color': _hex(COLOR_SCALE_HIGH),
+                'min_type': 'min', 'mid_type': 'percentile', 'mid_value': 50, 'max_type': 'max',
+            })
+
+    ws.set_row(0, 15 * max_header_lines + 8)
+    ws.freeze_panes(1, 1)
+    ws.autofilter(0, 0, n_rows, n_cols - 1)
+    return ws
+
+
 def write_summary_sheet(workbook, fmt_cache: dict, sheet_counts: dict, sheet_order: list):
     """Write a first 'Summary' tab: a title, generation timestamp, and
     one row per scan tab with its match count and a clickable link
@@ -1817,10 +2713,12 @@ def write_styled_workbook(results_dict: dict, path: str):
     sheet_counts = {name: (0 if df is None or df.empty else _summary_count(name, df)) for name, df in results_dict.items()}
 
     # Sheet order: All_Scans (one-page view) and Momentum first, then the
-    # RS Dashboard tabs (right after Summary/All_Scans/Momentum, ahead of
-    # the individual scans), then everything else in the logical scan
-    # order, then any leftovers.
-    ordered_names = [n for n in ('All_Scans', 'Momentum', 'RS_Groups', 'RS_Indices_Sectors') if n in results_dict]
+    # RS Dashboard tabs, its Leveraged_Proxies reference tab, and
+    # Trend_Template (right after Summary/All_Scans/Momentum, ahead of
+    # the individual scans -- all of these are dashboard-style tabs with
+    # their own bespoke schema/writer, not "scan matches"), then
+    # everything else in the logical scan order, then any leftovers.
+    ordered_names = [n for n in ('All_Scans', 'Momentum', 'RS_Groups', 'Leveraged_Proxies', 'RS_Indices_Sectors', 'Trend_Template') if n in results_dict]
     ordered_names += [n for n in SHEET_DISPLAY_ORDER if n in results_dict and n not in ordered_names]
     ordered_names += [n for n in results_dict if n not in ordered_names]
 
@@ -1840,6 +2738,15 @@ def write_styled_workbook(results_dict: dict, path: str):
                 write_rs_groups_sheet(workbook, fmt_cache, df)
             elif sheet_name == 'RS_Indices_Sectors':
                 write_rs_indices_sheet(workbook, fmt_cache, df)
+            elif sheet_name == 'Trend_Template':
+                write_trend_template_sheet(workbook, fmt_cache, df)
+            elif sheet_name == 'Leveraged_Proxies':
+                # Already in its final, bespoke column layout (see
+                # build_leveraged_proxies_df) -- skip prepare_sheet_df,
+                # which is built for the fixed scan-tab schema and would
+                # rename/drop these columns, same reasoning as
+                # Trend_Template above.
+                write_metric_sheet(workbook, fmt_cache, sheet_name, df)
             else:
                 styled_df = prepare_sheet_df(df, sheet_name)
                 write_metric_sheet(workbook, fmt_cache, sheet_name, styled_df)
@@ -1859,6 +2766,7 @@ if __name__ == "__main__":
         finviz_futures = {executor.submit(run_finviz_scan, name, filters): name for name, filters in finviz_scans.items()}
         lev_future = executor.submit(run_leveraged_etfs)
         rs_future = executor.submit(run_rs_dashboard)
+        tt_future = executor.submit(run_trend_template)
 
         for future in concurrent.futures.as_completed(ind_futures):
             name, df = future.result()
@@ -1893,9 +2801,22 @@ if __name__ == "__main__":
         # aren't "matches" from a scan and don't share the other tabs'
         # column schema, so folding them in would just produce a mess of
         # mismatched columns on the combined view.
-        rs_groups_df, rs_indices_df = rs_future.result()
+        rs_groups_df, rs_indices_df, proxy_dollar_volume = rs_future.result()
         results_dict['RS_Groups'] = rs_groups_df
         results_dict['RS_Indices_Sectors'] = rs_indices_df
+        # Leveraged_Proxies is a static reference table (which tickers
+        # are "liquid enough to trade directly," and what leveraged/
+        # inverse ETF -- if any -- could stand in for the ones that
+        # aren't) built from RS_Groups' own just-fetched dollar-volume
+        # figures (plus each proxy's own), not a scan of its own -- no
+        # separate future needed.
+        results_dict['Leveraged_Proxies'] = build_leveraged_proxies_df(rs_groups_df, proxy_dollar_volume)
+
+        # Trend_Template likewise stays out of all_collected_dfs/All_Scans --
+        # its own bespoke N-Value/Bucket-score schema doesn't match the
+        # other tabs' columns either.
+        tt_name, tt_df = tt_future.result()
+        results_dict[tt_name] = tt_df
 
     if momentum_dfs:
         master_momentum = pd.concat(momentum_dfs, ignore_index=True)
